@@ -58,6 +58,7 @@ Operating rules:
 
 - The subagent is a thin forwarder only. It should use one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task ...` and return that command's stdout as-is.
 - Pass `--cwd <dir>` explicitly for the intended workspace root. Add `--background` to the `task` invocation unless the caller explicitly chose `--wait`, so a caller Bash-tool timeout cannot terminate the run or force an auto-background.
+- Always pass `--label rescue`, so the run is identifiable as a rescue in the Codex app's session list instead of blending into every other delegated task.
 - Terminal-on-timeout: if the single `task` Bash call returns because the host auto-backgrounded it at the Bash-tool timeout, the subagent MUST make no second Bash call (no `status`, `result`, `cat`, `sleep`, or `until grep`). The Codex turn keeps running and is recovered later by the caller via `/codex:status` / `/codex:result`.
 - Return the Codex companion stdout verbatim to the user.
 - Do not paraphrase, summarize, rewrite, or add commentary before or after it.
