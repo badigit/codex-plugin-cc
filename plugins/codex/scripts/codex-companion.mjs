@@ -18,7 +18,7 @@ import {
   runAppServerTurn
 } from "./lib/codex.mjs";
 import { parseStructuredOutput, readOutputSchema } from "./lib/structured-output.mjs";
-import { buildPersistentTaskThreadName, DEFAULT_CONTINUE_PROMPT } from "./lib/task-thread.mjs";
+import { buildPersistentTaskThreadName, DEFAULT_CONTINUE_PROMPT, normalizeTaskLabel, TASK_THREAD_LABELS } from "./lib/task-thread.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
@@ -487,7 +487,7 @@ async function executeReviewRun(request) {
     persistThread: true,
     turnTimeoutMs: request.turnTimeoutMs,
     hardCeilingMs: request.hardCeilingMs,
-    threadName: `Codex Companion Review: ${context.target.label}`.slice(0, 80)
+    threadName: `Codex Review: ${context.target.label}`.slice(0, 80)
   });
   const parsed = parseStructuredOutput(result.finalMessage, {
     status: result.status,
@@ -568,7 +568,7 @@ async function executeTaskRun(request) {
     persistThread: true,
     turnTimeoutMs: request.turnTimeoutMs,
     hardCeilingMs: request.hardCeilingMs,
-    threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
+    threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT, request.label)
   });
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
@@ -679,7 +679,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, readOnly, resumeLast, jobId, turnTimeoutMs, hardCeilingMs }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, readOnly, resumeLast, label, jobId, turnTimeoutMs, hardCeilingMs }) {
   return {
     cwd,
     model,
@@ -688,6 +688,7 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, readOnly, resumeL
     write,
     readOnly,
     resumeLast,
+    label,
     jobId,
     turnTimeoutMs,
     hardCeilingMs
@@ -886,7 +887,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file", "turn-timeout-ms"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "turn-timeout-ms", "label"],
     booleanOptions: ["json", "write", "read-only", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
@@ -910,6 +911,9 @@ async function handleTask(argv) {
   if (write && readOnly) {
     throw new Error("Choose either --write or --read-only.");
   }
+  // Names the thread in the Codex app's session list. Closed set, because the
+  // prefix doubles as the lookup key for --resume-last (see lib/task-thread.mjs).
+  const label = normalizeTaskLabel(options.label);
   const taskMetadata = buildTaskRunMetadata({
     prompt,
     resumeLast
@@ -928,6 +932,7 @@ async function handleTask(argv) {
       write,
       readOnly,
       resumeLast,
+      label,
       jobId: job.id,
       turnTimeoutMs: resolveTurnTimeoutMsFromOptions(options),
       hardCeilingMs: resolveTurnHardCeilingMsFromOptions(options)
@@ -949,6 +954,7 @@ async function handleTask(argv) {
         write,
         readOnly,
         resumeLast,
+        label,
         jobId: job.id,
         turnTimeoutMs: resolveTurnTimeoutMsFromOptions(options),
         hardCeilingMs: resolveTurnHardCeilingMsFromOptions(options),

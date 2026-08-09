@@ -589,7 +589,7 @@ rl.on("line", (line) => {
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)
-          : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
+          : taskPayload(prompt, thread.name && /^Codex (Companion Task|Task|Review|Rescue)/.test(thread.name) && prompt.includes("Continue from the current thread state"));
 
         if (
           BEHAVIOR === "with-subagent" ||

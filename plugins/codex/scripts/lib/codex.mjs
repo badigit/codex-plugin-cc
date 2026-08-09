@@ -45,10 +45,13 @@ import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from 
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
 import { validateExplicitReasoningSelection, validateReasoningSelection } from "./model-catalog.mjs";
-import { TASK_THREAD_PREFIX } from "./task-thread.mjs";
+import { isTaskThreadName, taskThreadSearchTerm } from "./task-thread.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
-const REVIEW_THREAD_PREFIX = "Codex Companion Review";
+// [dim] Review threads are never looked up by name (unlike task threads), so
+// this rename is cosmetic: it just stops every row in the Codex app's session
+// list from starting with the plumbing word "Companion".
+const REVIEW_THREAD_PREFIX = "Codex Review";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
 const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
 
@@ -1502,11 +1505,11 @@ export async function findLatestTaskThread(cwd) {
       limit: 20,
       sortKey: "updated_at",
       sourceKinds: ["appServer"],
-      searchTerm: TASK_THREAD_PREFIX
+      searchTerm: taskThreadSearchTerm()
     });
 
     return (
-      response.data.find((thread) => typeof thread.name === "string" && thread.name.startsWith(TASK_THREAD_PREFIX)) ??
+      response.data.find((thread) => isTaskThreadName(thread.name)) ??
       null
     );
   });
