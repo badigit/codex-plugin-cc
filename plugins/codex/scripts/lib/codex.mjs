@@ -143,13 +143,19 @@ function cleanCodexStderr(stderr) {
     .join("\n");
 }
 
-// [dim] Fork-local: restore the upstream read-only default.
-// axisrow relaxed `?? "read-only"` to `?? null` so the app-server falls back to
-// the user's ~/.codex/config.toml. On a host configured with
-// sandbox_mode = "danger-full-access" + approval_policy = "never" that turns an
-// unflagged delegated task into full filesystem access with no approvals.
-// Callers that genuinely need writes pass sandbox explicitly ("workspace-write").
-const DEFAULT_SANDBOX = "read-only";
+// [dim] `null` is deliberate, not an omission: with no sandbox in the params the
+// app-server resolves it from the host's own ~/.codex/config.toml. The host is
+// the authority on how much access its agents get — a plugin that quietly pins
+// read-only over a machine configured for full access is overriding a decision
+// that was not its to make, and does it invisibly.
+//
+// The consequence is exactly what the host asked for: on a machine running
+// sandbox_mode = "danger-full-access" with approval_policy = "never", an
+// unflagged delegated task inherits full filesystem access without approvals.
+// Explicit callers are unaffected — --write and --read-only still pin their own
+// sandbox, and assertExplicitSandboxHonored still fails closed when an explicit
+// read-only pin is not honored on resume.
+const DEFAULT_SANDBOX = null;
 
 /** @returns {ThreadStartParams} */
 function buildThreadParams(cwd, options = {}) {

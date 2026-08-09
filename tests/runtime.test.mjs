@@ -620,8 +620,8 @@ test("task --resume-last resumes the latest persisted task thread", () => {
   assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
   assert.deepEqual(readPersistedJob(repo).resolved, FAKE_RESOLVED_SETTINGS);
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
-  // [dim] fork pins the upstream read-only default; unflagged runs must not inherit the host sandbox_mode.
-  assert.equal(fakeState.lastThreadResume.sandbox, "read-only");
+  // [dim] no sandbox in the params: the host's ~/.codex/config.toml decides.
+  assert.equal(fakeState.lastThreadResume.sandbox, null);
 });
 
 test("task --resume-last is not permanently blocked by a job stuck 'running' with a dead worker pid (upstream #392)", () => {
@@ -676,8 +676,8 @@ test("task --resume-last is not permanently blocked by a job stuck 'running' wit
     assert.doesNotMatch(resume.stderr, /is still running/i);
     assert.equal(resume.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
     const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
-    // [dim] fork pins the upstream read-only default; unflagged runs must not inherit the host sandbox_mode.
-    assert.equal(fakeState.lastThreadResume.sandbox, "read-only");
+    // [dim] no sandbox in the params: the host's ~/.codex/config.toml decides.
+    assert.equal(fakeState.lastThreadResume.sandbox, null);
   });
 });
 
@@ -1122,8 +1122,8 @@ test("task forwards model selection and reasoning effort to app-server turn/star
 
   assert.equal(result.status, 0, result.stderr);
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
-  // [dim] fork pins the upstream read-only default; unflagged runs must not inherit the host sandbox_mode.
-  assert.equal(fakeState.lastThreadStart.sandbox, "read-only");
+  // [dim] no sandbox in the params: the host's ~/.codex/config.toml decides.
+  assert.equal(fakeState.lastThreadStart.sandbox, null);
   assert.equal(fakeState.lastTurnStart.model, "gpt-5.3-codex-spark");
   assert.equal(fakeState.lastTurnStart.effort, "low");
   assert.deepEqual(readPersistedJob(repo).resolved, {
