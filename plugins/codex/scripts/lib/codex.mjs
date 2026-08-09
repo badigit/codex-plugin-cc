@@ -140,13 +140,21 @@ function cleanCodexStderr(stderr) {
     .join("\n");
 }
 
+// [dim] Fork-local: restore the upstream read-only default.
+// axisrow relaxed `?? "read-only"` to `?? null` so the app-server falls back to
+// the user's ~/.codex/config.toml. On a host configured with
+// sandbox_mode = "danger-full-access" + approval_policy = "never" that turns an
+// unflagged delegated task into full filesystem access with no approvals.
+// Callers that genuinely need writes pass sandbox explicitly ("workspace-write").
+const DEFAULT_SANDBOX = "read-only";
+
 /** @returns {ThreadStartParams} */
 function buildThreadParams(cwd, options = {}) {
   return {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? null,
+    sandbox: options.sandbox ?? DEFAULT_SANDBOX,
     config: options.effort ? { model_reasoning_effort: options.effort } : null,
     serviceName: SERVICE_NAME,
     ephemeral: options.ephemeral ?? true
@@ -160,7 +168,7 @@ function buildResumeParams(threadId, cwd, options = {}) {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? null
+    sandbox: options.sandbox ?? DEFAULT_SANDBOX
   };
 }
 
