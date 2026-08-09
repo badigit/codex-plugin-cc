@@ -1,6 +1,15 @@
 import { spawnSync } from "node:child_process";
 import process from "node:process";
 
+// [dim] Windows needs a shell to run .cmd/.bat shims (codex, npm), but the shell
+// must be the platform default (cmd.exe via ComSpec) — never process.env.SHELL.
+// On a machine with Git for Windows that variable points at a POSIX bash whose
+// quoting rules do not match the argument concatenation spawn performs here, so
+// the command line silently changes meaning (its own path contains spaces).
+export function windowsSpawnShell() {
+  return process.platform === "win32" ? true : false;
+}
+
 export function runCommand(command, args = [], options = {}) {
   const result = spawnSync(command, args, {
     cwd: options.cwd,
@@ -9,7 +18,7 @@ export function runCommand(command, args = [], options = {}) {
     input: options.input,
     maxBuffer: options.maxBuffer,
     stdio: options.stdio ?? "pipe",
-    shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
+    shell: options.shell ?? windowsSpawnShell(),
     windowsHide: true
   });
 
