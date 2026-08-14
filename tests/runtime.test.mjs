@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { homeEnv, initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import {
   resolveCancelableJob,
@@ -331,7 +331,7 @@ test("transfer delegates the current Claude session directly to native import", 
     cwd: repo,
     env: {
       ...buildEnv(binDir),
-      HOME: home,
+      ...homeEnv(home),
       CODEX_HOME: path.join(home, ".codex"),
       CODEX_COMPANION_TRANSCRIPT_PATH: sourcePath
     }
@@ -376,7 +376,7 @@ test("transfer reports an actionable upgrade error when native import is unsuppo
     cwd: repo,
     env: {
       ...buildEnv(binDir),
-      HOME: home,
+      ...homeEnv(home),
       CODEX_HOME: path.join(home, ".codex")
     }
   });
@@ -406,7 +406,7 @@ test("transfer fails visibly when native import completes without a ledger recor
     cwd: repo,
     env: {
       ...buildEnv(binDir),
-      HOME: home,
+      ...homeEnv(home),
       CODEX_HOME: path.join(home, ".codex")
     }
   });
@@ -432,11 +432,18 @@ test("transfer rejects sources outside the Claude projects directory", () => {
 
   const result = run("node", [SCRIPT, "transfer", "--source", sourcePath], {
     cwd: repo,
-    env: { ...buildEnv(binDir), HOME: home }
+    env: { ...buildEnv(binDir), ...homeEnv(home) }
   });
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /only from .*\.claude.*projects/);
+  // The guard has to be measured against the fixture's home, not the developer's:
+  // when only HOME was set, Windows resolved os.homedir() to the real user and
+  // this test passed for the wrong reason — every source looked "outside".
+  assert.ok(
+    result.stderr.includes(home),
+    `expected the rejection to name the fixture home ${home}, got: ${result.stderr}`
+  );
 });
 
 test("task reports the actual Codex auth error when the run is rejected", () => {

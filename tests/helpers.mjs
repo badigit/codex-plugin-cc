@@ -75,6 +75,14 @@ function resolveTimeoutScale() {
  * @param {number} ms Timeout budget measured on an idle machine.
  * @returns {number} The budget adjusted for contention.
  */
+// os.homedir() reads USERPROFILE on Windows and $HOME everywhere else, so a
+// fixture that only sets HOME still resolves to the real user's home on
+// Windows — and a guard keyed off ~/.claude (transfer's projects-dir check)
+// then compares the fixture against the developer's actual directory.
+export function homeEnv(home) {
+  return { HOME: home, USERPROFILE: home };
+}
+
 export function scaleTimeout(ms) {
   return Math.round(ms * TIMEOUT_SCALE);
 }
