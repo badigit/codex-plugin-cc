@@ -3085,6 +3085,209 @@ test("session end keeps finished results and marks interrupted jobs failed", asy
   assert.equal(otherJob.logFile, otherSessionLog);
 });
 
+test("session start reaps workers and broker files their session left behind", async () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const stateDir = resolveStateDir(repo);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const strandedLog = path.join(jobsDir, "stranded.log");
+  const strandedJobFile = path.join(jobsDir, "task-stranded.json");
+  fs.writeFileSync(strandedLog, "stranded\n", "utf8");
+  fs.writeFileSync(strandedJobFile, JSON.stringify({ id: "task-stranded" }, null, 2), "utf8");
+
+  // A worker whose process is already gone: the previous session was closed
+  // through the desktop window, which never delivers SessionEnd, so nothing
+  // ever flipped this record off "running".
+  const corpse = spawn(process.execPath, ["-e", "setTimeout(() => {}, 50)"], {
+    cwd: repo,
+    detached: true,
+    stdio: "ignore"
+  });
+  corpse.unref();
+  const deadPid = corpse.pid;
+  await waitFor(() => {
+    try {
+      process.kill(deadPid, 0);
+      return false;
+    } catch (error) {
+      return error?.code === "ESRCH";
+    }
+  });
+
+  const brokerSessionDir = makeTempDir();
+  const brokerPidFile = path.join(brokerSessionDir, "broker.pid");
+  const brokerLogFile = path.join(brokerSessionDir, "broker.log");
+  fs.writeFileSync(brokerPidFile, `${deadPid}\n`, "utf8");
+  fs.writeFileSync(brokerLogFile, "broker\n", "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "broker.json"),
+    `${JSON.stringify(
+      {
+        endpoint: "pipe:\\.\pipe\cxc-dead-codex-app-server",
+        pidFile: brokerPidFile,
+        logFile: brokerLogFile,
+        sessionDir: brokerSessionDir,
+        pid: deadPid
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-stranded",
+            status: "running",
+            title: "Codex Task",
+            sessionId: "sess-previous",
+            pid: deadPid,
+            logFile: strandedLog,
+            createdAt: "2026-03-18T15:30:00.000Z",
+            updatedAt: "2026-03-18T15:31:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SESSION_HOOK, "SessionStart"], {
+    cwd: repo,
+    env: { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-new" },
+    input: JSON.stringify({
+      hook_event_name: "SessionStart",
+      session_id: "sess-new",
+      cwd: repo
+    })
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  // The record must stop claiming to be running: a job frozen at "running"
+  // with a dead pid blocks --resume-last and reads as work still in flight.
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const stranded = state.jobs.find((job) => job.id === "task-stranded");
+  assert.equal(stranded.status, "failed");
+  assert.equal(stranded.pid, null);
+  assert.ok(stranded.errorMessage);
+
+  // Reaping is bookkeeping, not deletion — the log and result file stay.
+  assert.equal(fs.existsSync(strandedLog), true);
+  assert.equal(fs.existsSync(strandedJobFile), true);
+  const storedStranded = JSON.parse(fs.readFileSync(strandedJobFile, "utf8"));
+  assert.equal(storedStranded.status, "failed");
+
+  // The broker records point at a process that no longer exists; leaving them
+  // behind strands the pid and log files for good once the workspace goes idle.
+  assert.equal(fs.existsSync(path.join(stateDir, "broker.json")), false);
+  assert.equal(fs.existsSync(brokerPidFile), false);
+  assert.equal(fs.existsSync(brokerLogFile), false);
+});
+
+test("session start leaves a live worker and a live broker untouched", async (t) => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(path.join(stateDir, "jobs"), { recursive: true });
+
+  // Two sessions can share one workspace: a second window opening must never
+  // reap the first one's in-flight run or the broker they share.
+  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    cwd: repo,
+    detached: true,
+    stdio: "ignore"
+  });
+  sleeper.unref();
+  t.after(() => {
+    try {
+      process.kill(sleeper.pid, "SIGTERM");
+    } catch {
+      // Ignore missing process.
+    }
+  });
+
+  const brokerSessionDir = makeTempDir();
+  const brokerPidFile = path.join(brokerSessionDir, "broker.pid");
+  fs.writeFileSync(brokerPidFile, `${sleeper.pid}\n`, "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "broker.json"),
+    `${JSON.stringify(
+      {
+        endpoint: "pipe:\\.\pipe\cxc-live-codex-app-server",
+        pidFile: brokerPidFile,
+        logFile: null,
+        sessionDir: brokerSessionDir,
+        pid: sleeper.pid
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-live",
+            status: "running",
+            title: "Codex Task",
+            sessionId: "sess-other-window",
+            pid: sleeper.pid,
+            createdAt: "2026-03-18T15:30:00.000Z",
+            updatedAt: "2026-03-18T15:31:00.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SESSION_HOOK, "SessionStart"], {
+    cwd: repo,
+    env: { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-new" },
+    input: JSON.stringify({
+      hook_event_name: "SessionStart",
+      session_id: "sess-new",
+      cwd: repo
+    })
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  const live = state.jobs.find((job) => job.id === "task-live");
+  assert.equal(live.status, "running");
+  assert.equal(live.pid, sleeper.pid);
+
+  assert.equal(fs.existsSync(path.join(stateDir, "broker.json")), true);
+  assert.equal(fs.existsSync(brokerPidFile), true);
+  assert.doesNotThrow(() => process.kill(sleeper.pid, 0));
+});
+
 test("stop hook runs a stop-time review task and blocks on findings when the review gate is enabled", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

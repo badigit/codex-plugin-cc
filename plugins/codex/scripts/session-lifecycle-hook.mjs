@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { terminateProcessTree } from "./lib/process.mjs";
+import { isProcessAlive, terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
   clearBrokerSession,
@@ -14,6 +14,7 @@ import {
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
 import {
+  listJobs,
   loadState,
   readJobFile,
   resolveJobFile,
@@ -126,10 +127,52 @@ function cleanupSessionJobs(cwd, sessionId) {
   }
 }
 
+// Closing the desktop window never delivers SessionEnd, so the teardown that
+// hangs off it simply does not run for the way most sessions actually end:
+// records stay frozen at "running" behind a pid that is long gone, and the
+// broker's pid and log files outlive the process they describe. Nothing else
+// sweeps them either — the workspace has to be used again for the lazy paths
+// (listJobs, loadReusableBrokerSession) to notice. So the next session opening
+// on this workspace picks up what the previous one could not put down.
+//
+// Only the dead are reaped. A live pid may belong to a second window working
+// in the same workspace, or to a run deliberately left finishing, and killing
+// either would destroy work this session never started.
+function reapAbandonedRuntime(cwd) {
+  // listJobs reconciles queued/running records whose pid is gone, flipping
+  // them to failed and rewriting their per-job files. Results and logs stay.
+  listJobs(cwd);
+
+  const brokerSession = loadBrokerSession(cwd);
+  if (!brokerSession || isProcessAlive(brokerSession.pid)) {
+    return;
+  }
+
+  // The pid is dead, so there is nothing to kill — and nothing that may be
+  // killed: the OS could have recycled that pid into an unrelated process by
+  // now. Drop the files only, exactly as loadReusableBrokerSession does when
+  // it finds the same situation.
+  teardownBrokerSession({
+    endpoint: brokerSession.endpoint ?? null,
+    pidFile: brokerSession.pidFile ?? null,
+    logFile: brokerSession.logFile ?? null,
+    sessionDir: brokerSession.sessionDir ?? null,
+    pid: null,
+    killProcess: null
+  });
+  clearBrokerSession(cwd);
+}
+
 function handleSessionStart(input) {
   appendEnvVar(SESSION_ID_ENV, input.session_id);
   appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
+
+  try {
+    reapAbandonedRuntime(input.cwd || process.cwd());
+  } catch {
+    // Housekeeping must never keep a session from starting.
+  }
 }
 
 async function handleSessionEnd(input) {
