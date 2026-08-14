@@ -2938,7 +2938,7 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
-test("session end fully cleans up jobs for the ending session", async (t) => {
+test("session end keeps finished results and marks interrupted jobs failed", async (t) => {
   const repo = makeTempDir();
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
@@ -3040,10 +3040,13 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(fs.existsSync(otherSessionLog), true);
   assert.equal(fs.existsSync(otherJobFile), true);
-  assert.deepEqual(
-    fs.readdirSync(path.dirname(otherJobFile)).sort(),
-    [path.basename(otherJobFile), path.basename(otherSessionLog)].sort()
-  );
+
+  // A finished run is the whole point of having delegated to Codex: its result
+  // file and log must survive the session that ordered it, so the next session
+  // can still fetch it by id via `result`.
+  assert.equal(fs.existsSync(completedJobFile), true);
+  assert.equal(fs.existsSync(completedLog), true);
+  assert.equal(fs.existsSync(runningLog), true);
 
   await waitFor(() => {
     try {
@@ -3055,8 +3058,30 @@ test("session end fully cleans up jobs for the ending session", async (t) => {
   });
 
   const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
-  assert.deepEqual(state.jobs.map((job) => job.id), ["review-other"]);
-  const otherJob = state.jobs[0];
+  assert.deepEqual(
+    state.jobs.map((job) => job.id).sort(),
+    ["review-completed", "review-other", "review-running"]
+  );
+
+  const completedJob = state.jobs.find((job) => job.id === "review-completed");
+  assert.equal(completedJob.status, "completed");
+  assert.equal(completedJob.logFile, completedLog);
+
+  // The interrupted run is stopped, but it is recorded as failed with a reason
+  // instead of vanishing — silence is what makes a lost run indistinguishable
+  // from an empty answer.
+  const interruptedJob = state.jobs.find((job) => job.id === "review-running");
+  assert.equal(interruptedJob.status, "failed");
+  assert.equal(interruptedJob.phase, "failed");
+  assert.equal(interruptedJob.pid, null);
+  assert.match(interruptedJob.errorMessage ?? "", /session ended/i);
+  assert.ok(interruptedJob.completedAt);
+
+  const storedInterrupted = JSON.parse(fs.readFileSync(runningJobFile, "utf8"));
+  assert.equal(storedInterrupted.status, "failed");
+  assert.match(storedInterrupted.errorMessage ?? "", /session ended/i);
+
+  const otherJob = state.jobs.find((job) => job.id === "review-other");
   assert.equal(otherJob.logFile, otherSessionLog);
 });
 

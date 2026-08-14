@@ -13,12 +13,21 @@ import {
   sendBrokerShutdown,
   teardownBrokerSession
 } from "./lib/broker-lifecycle.mjs";
-import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import {
+  loadState,
+  readJobFile,
+  resolveJobFile,
+  resolveStateFile,
+  saveState,
+  writeJobFile
+} from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
+const SESSION_ENDED_MESSAGE =
+  "Claude session ended before the Codex turn finished; the run was stopped.";
 
 function readHookInput() {
   const raw = fs.readFileSync(0, "utf8").trim();
@@ -50,17 +59,21 @@ function cleanupSessionJobs(cwd, sessionId) {
     return;
   }
 
-  const state = loadState(workspaceRoot);
-  const removedJobs = state.jobs.filter((job) => job.sessionId === sessionId);
-  if (removedJobs.length === 0) {
+  // Stop this session's still-running workers: the broker is torn down right
+  // after this, so leaving them alive would only strand orphans. Everything
+  // this session already produced stays on disk. Deleting the records here
+  // would take their per-job result files and logs with them (saveState drops
+  // the files of any job it no longer retains), so a session that ends while a
+  // delegated run is finishing would destroy the very answer it was waiting
+  // for — with no trace that anything was lost.
+  const activeJobs = loadState(workspaceRoot).jobs.filter(
+    (job) => job.sessionId === sessionId && (job.status === "queued" || job.status === "running")
+  );
+  if (activeJobs.length === 0) {
     return;
   }
 
-  for (const job of removedJobs) {
-    const stillRunning = job.status === "queued" || job.status === "running";
-    if (!stillRunning) {
-      continue;
-    }
+  for (const job of activeJobs) {
     try {
       terminateProcessTree(job.pid ?? Number.NaN);
     } catch {
@@ -68,10 +81,49 @@ function cleanupSessionJobs(cwd, sessionId) {
     }
   }
 
-  saveState(workspaceRoot, {
-    ...state,
-    jobs: state.jobs.filter((job) => job.sessionId !== sessionId)
+  const stoppedAt = new Date().toISOString();
+  const interruptedIds = new Set(activeJobs.map((job) => job.id));
+  // Re-read after termination: the worker may have written its own final state
+  // between the read above and the kill, and that write must not be rolled back.
+  const state = loadState(workspaceRoot);
+  const stoppedJobs = [];
+  const jobs = state.jobs.map((job) => {
+    if (!interruptedIds.has(job.id) || (job.status !== "queued" && job.status !== "running")) {
+      return job;
+    }
+    const stoppedJob = {
+      ...job,
+      status: "failed",
+      phase: "failed",
+      pid: null,
+      completedAt: stoppedAt,
+      updatedAt: stoppedAt,
+      errorMessage: SESSION_ENDED_MESSAGE
+    };
+    stoppedJobs.push(stoppedJob);
+    return stoppedJob;
   });
+
+  saveState(workspaceRoot, { ...state, jobs });
+
+  for (const job of stoppedJobs) {
+    const jobFile = resolveJobFile(workspaceRoot, job.id);
+    if (!fs.existsSync(jobFile)) {
+      continue;
+    }
+    try {
+      writeJobFile(workspaceRoot, job.id, {
+        ...readJobFile(jobFile),
+        status: job.status,
+        phase: job.phase,
+        pid: job.pid,
+        completedAt: job.completedAt,
+        errorMessage: job.errorMessage
+      });
+    } catch {
+      // The state record is still authoritative when a per-job file is unreadable.
+    }
+  }
 }
 
 function handleSessionStart(input) {
