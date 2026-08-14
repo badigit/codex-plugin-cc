@@ -242,6 +242,21 @@ test("hooks keep session-end cleanup and stop gating enabled", () => {
   assert.match(source, /session-lifecycle-hook\.mjs/);
 });
 
+test("session end hook gets a timeout it can finish within", () => {
+  const config = JSON.parse(read("hooks/hooks.json"));
+  const sessionEnd = config.hooks.SessionEnd[0].hooks[0];
+
+  // The hook shuts the broker down, kills every worker this session left
+  // running and rewrites their records. Each kill is a synchronous taskkill on
+  // Windows, so the cost grows with the number of active jobs: a measured run
+  // with three of them took 3.6s. At the stock 5s the hook was cancelled
+  // mid-flight, which stranded the broker and its workers as orphans.
+  assert.ok(
+    sessionEnd.timeout >= 30,
+    `SessionEnd hook timeout is ${sessionEnd.timeout}s, too tight for broker teardown`
+  );
+});
+
 test("setup command can offer Codex install and still points users to codex login", () => {
   const setup = read("commands/setup.md");
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
