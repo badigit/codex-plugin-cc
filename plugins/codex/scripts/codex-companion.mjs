@@ -69,6 +69,11 @@ import {
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
+// The wait suggested to the caller right after a background launch. The status
+// default (4 minutes) is tuned for a human checking in; a delegated rescue run
+// routinely thinks for longer, and a wait that expires before the run finishes
+// drops the caller straight back into "Codex said nothing".
+const BACKGROUND_COLLECT_TIMEOUT_MS = 1800000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const TASK_WORKER_RECORD_WAIT_TIMEOUT_MS = 1000;
 // Foreground runs are invoked by Claude Code's Bash tool, which SIGKILLs node
@@ -631,8 +636,24 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
   };
 }
 
+// The spawn text is the only thing the calling agent ever receives: the rescue
+// subagent forwards this stdout verbatim and its contract forbids it to poll,
+// fetch results, or follow up. "Started in the background" alone therefore
+// reads exactly like an empty answer, and that is how finished runs were left
+// uncollected. So the launch has to say the answer is not here yet and carry
+// the two commands that fetch it. A slash command will not do — those are for
+// the human; the caller cannot invoke one.
 function renderQueuedTaskLaunch(payload) {
-  return `${payload.title} started in the background as ${payload.jobId}. Check /codex:status ${payload.jobId} for progress.\n`;
+  return [
+    `${payload.title} started in the background as ${payload.jobId}.`,
+    "This is NOT the answer: Codex is still working, and nothing further arrives on its own.",
+    "To collect it, block until the run finishes:",
+    `  ${payload.waitCommand}`,
+    "then read the answer:",
+    `  ${payload.resultCommand}`,
+    "(--wait polls until the job leaves queued/running; raise --timeout-ms for a longer run.)",
+    ""
+  ].join("\n");
 }
 
 function getJobKindLabel(kind, jobClass) {
@@ -788,6 +809,14 @@ async function runForegroundCommand(job, runner, options = {}) {
   return execution;
 }
 
+// Quote only what needs it: the caller pastes this straight into a shell.
+function buildCompanionCommand(args) {
+  const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
+  return ["node", scriptPath, ...args]
+    .map((part) => (/[\s"']/.test(part) ? `"${part.replace(/"/g, '\\"')}"` : part))
+    .join(" ");
+}
+
 function spawnDetachedTaskWorker(cwd, jobId) {
   const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
   const child = spawn(process.execPath, [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId], {
@@ -823,7 +852,17 @@ function enqueueBackgroundTask(cwd, job, request) {
       status: "queued",
       title: job.title,
       summary: job.summary,
-      logFile
+      logFile,
+      waitCommand: buildCompanionCommand([
+        "status",
+        job.id,
+        "--wait",
+        "--timeout-ms",
+        String(BACKGROUND_COLLECT_TIMEOUT_MS),
+        "--cwd",
+        cwd
+      ]),
+      resultCommand: buildCompanionCommand(["result", job.id, "--cwd", cwd])
     },
     logFile
   };

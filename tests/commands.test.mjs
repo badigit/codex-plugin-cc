@@ -219,6 +219,20 @@ test("transfer, result, and cancel commands are exposed as deterministic runtime
   assert.match(resultHandling, /if Codex was never successfully invoked, do not generate a substitute answer at all/i);
 });
 
+test("the contract tells the caller to collect a backgrounded rescue result", () => {
+  const resultHandling = read("skills/codex-result-handling/SKILL.md");
+  const rescueAgent = read("agents/codex-rescue.md");
+
+  // The subagent finishing is not the Codex run finishing. Without this said
+  // out loud, the caller reads the launch text as an empty answer and moves on
+  // while the answer sits on disk waiting to be fetched.
+  assert.match(resultHandling, /started in the background/i);
+  assert.match(resultHandling, /is not the answer/i);
+  assert.match(resultHandling, /--wait/);
+  assert.match(resultHandling, /result <job-id>|`result`/i);
+  assert.match(rescueAgent, /verbatim|exactly as-is/i);
+});
+
 test("internal docs use task terminology for rescue runs", () => {
   const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
   const promptingSkill = read("skills/gpt-5-4-prompting/SKILL.md");

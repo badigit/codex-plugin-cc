@@ -1477,6 +1477,50 @@ test("task using the shared broker still completes when Codex spawns subagents",
   assert.equal(result.stdout, "Handled the requested task.\nTask prompt accepted.\n");
 });
 
+test("task --background hands the caller a runnable way to collect the answer", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const launched = run("node", [SCRIPT, "task", "--background", "investigate the flaky worker timeout"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+
+  const jobId = launched.stdout.match(/task-[a-z0-9-]+/)?.[0];
+  assert.ok(jobId, launched.stdout);
+
+  // The spawn text is all the calling agent ever sees: the rescue subagent
+  // forwards it verbatim and is forbidden to poll. Saying only "started in the
+  // background" reads exactly like an empty answer, which is how finished runs
+  // were left uncollected. It has to say the answer is not here yet AND carry
+  // the commands that fetch it — a slash command does not qualify, the caller
+  // cannot run one.
+  assert.match(launched.stdout, /not the answer|still (running|working)/i);
+  assert.match(launched.stdout, new RegExp(`status ${jobId} --wait`));
+  assert.match(launched.stdout, new RegExp(`result ${jobId}`));
+  assert.ok(
+    launched.stdout.includes(SCRIPT),
+    `spawn text must name the companion script by absolute path:
+${launched.stdout}`
+  );
+
+  const launchedJson = run("node", [SCRIPT, "task", "--background", "--json", "another investigation"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(launchedJson.status, 0, launchedJson.stderr);
+  const payload = JSON.parse(launchedJson.stdout);
+  assert.equal(payload.status, "queued");
+  assert.match(payload.waitCommand, new RegExp(`status ${payload.jobId} --wait`));
+  assert.match(payload.resultCommand, new RegExp(`result ${payload.jobId}`));
+});
+
 test("task --background preserves --read-only through the detached worker", async () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

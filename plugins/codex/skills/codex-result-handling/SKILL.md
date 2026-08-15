@@ -6,6 +6,25 @@ user-invocable: false
 
 # Codex Result Handling
 
+## A backgrounded run is not finished when the helper returns
+
+`codex:codex-rescue` launches the run with `--background` and returns
+immediately. Its stdout says `started in the background as <job-id>` and names
+the two commands that collect the answer. That text is a receipt: it is not the answer, and it is not a verdict about the answer.
+
+- The notification that the subagent finished means the *forwarder* finished.
+  The Codex turn is still running, and nothing else arrives on its own.
+- Never present that receipt to the user as Codex's answer, and never read it
+  as "Codex found nothing" or "Codex stayed silent". It says neither.
+- Collect the answer yourself with the commands printed in the receipt: run the
+  `status <job-id> --wait ...` command to block until the run leaves
+  queued/running, then the `result <job-id> ...` command to read it. If the
+  wait times out, the run is still going — wait again with a larger
+  `--timeout-ms`, do not conclude anything from the timeout.
+- Only after `result` returns do the presentation rules below apply.
+- Tell the user the run is in flight before you start waiting, so a long Codex
+  turn does not look like a hang.
+
 When the helper returns Codex output:
 - Preserve the helper's verdict, summary, findings, and next steps structure.
 - For review output, present findings first and keep them ordered by severity.

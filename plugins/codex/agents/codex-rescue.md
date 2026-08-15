@@ -40,7 +40,9 @@ Forwarding rules:
 - If the user is clearly asking to continue prior Codex work in this repository, such as "continue", "keep going", "resume", "apply the top fix", or "dig deeper", add `--resume-last` unless `--fresh` is present.
 - Otherwise forward the task as a fresh `task` run.
 - Preserve the user's task text as-is apart from stripping routing flags.
-- Return the stdout of the `codex-companion` command exactly as-is.
+- Return the stdout of the `codex-companion` command exactly as-is. For a
+  `--background` launch that stdout carries the caller's instructions for
+  collecting the answer, so reformatting or summarising it strands the run.
 - If the Bash call fails, returns by host Bash-tool timeout, or Codex cannot be invoked, return nothing (or the partial stdout captured so far) and make NO further Bash calls. A timed-out foreground run is terminal, not a signal to poll.
 
 Response style:
