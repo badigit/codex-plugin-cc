@@ -21,8 +21,12 @@ import type {
   ModelListResponse,
   ThreadResumeParams as RawThreadResumeParams,
   ThreadResumeResponse,
+  ThreadArchiveParams,
+  ThreadArchiveResponse,
   ThreadSetNameParams,
   ThreadSetNameResponse,
+  ThreadUnarchiveParams,
+  ThreadUnarchiveResponse,
   ThreadStartParams as RawThreadStartParams,
   ThreadStartResponse,
   Turn,
@@ -67,6 +71,8 @@ export interface AppServerMethodMap {
   "thread/start": { params: ThreadStartParams; result: ThreadStartResponse };
   "thread/resume": { params: ThreadResumeParams; result: ThreadResumeResponse };
   "thread/name/set": { params: ThreadSetNameParams; result: ThreadSetNameResponse };
+  "thread/archive": { params: ThreadArchiveParams; result: ThreadArchiveResponse };
+  "thread/unarchive": { params: ThreadUnarchiveParams; result: ThreadUnarchiveResponse };
   "thread/list": { params: ThreadListParams; result: ThreadListResponse };
   "model/list": { params: ModelListParams; result: ModelListResponse };
   "review/start": { params: ReviewStartParams; result: ReviewStartResponse };

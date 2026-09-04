@@ -4019,3 +4019,72 @@ test("adversarial review with stalled turn/start times out via --turn-timeout-ms
   const storedJob = readPersistedJob(repo);
   assert.equal(storedJob.status, "failed", "job must be marked failed");
 });
+
+test("завершённый task-тред уходит из списка сессий Codex", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--write", "fix the flaky test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const persisted = state.threads.filter((thread) => !thread.ephemeral);
+  assert.equal(persisted.length, 1, "ожидался ровно один персистентный тред");
+  assert.equal(persisted[0].archived, true, "тред должен быть заархивирован после завершения хода");
+});
+
+test("CODEX_COMPANION_KEEP_THREADS_VISIBLE оставляет тред в списке", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--write", "fix the flaky test"], {
+    cwd: repo,
+    env: { ...buildEnv(binDir), CODEX_COMPANION_KEEP_THREADS_VISIBLE: "1" }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const persisted = state.threads.filter((thread) => !thread.ephemeral);
+  assert.equal(persisted.length, 1);
+  assert.notEqual(persisted[0].archived, true);
+});
+
+test("--resume-last снимает архив и продолжает тот же тред", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const first = run("node", [SCRIPT, "task", "--write", "start the work"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(first.status, 0, first.stderr);
+  const afterFirst = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const started = afterFirst.threads.filter((thread) => !thread.ephemeral);
+  assert.equal(started[0].archived, true);
+
+  // Фикстура повторяет настоящий сервер: resume архивного треда отвергается.
+  // Значит зелёный статус здесь и есть доказательство, что unarchive отработал.
+  const second = run("node", [SCRIPT, "task", "--write", "--resume-last", "keep going"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(second.status, 0, second.stderr);
+
+  const afterSecond = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const persisted = afterSecond.threads.filter((thread) => !thread.ephemeral);
+  assert.equal(persisted.length, 1, "resume не должен плодить новый тред");
+  assert.equal(persisted[0].id, started[0].id);
+  assert.equal(persisted[0].archived, true, "после продолжения тред снова скрыт");
+});

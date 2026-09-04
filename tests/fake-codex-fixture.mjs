@@ -53,7 +53,11 @@ function buildThread(thread) {
     path: null,
     cwd: thread.cwd,
     cliVersion: "fake-codex",
-    source: "appServer",
+    // Real codex (0.146.0) records EVERY app-server thread as "vscode" — the
+    // kind comes from the transport, not from clientInfo. The fixture said
+    // "appServer", which is why a lookup filtered on sourceKinds:["appServer"]
+    // passed here and matched nothing in production.
+    source: "vscode",
     agentNickname: null,
     agentRole: null,
     gitInfo: null,
@@ -392,8 +396,32 @@ rl.on("line", (line) => {
         break;
       }
 
+      case "thread/archive": {
+        const thread = ensureThread(state, message.params.threadId);
+        thread.archived = true;
+        thread.updatedAt = now();
+        saveState(state);
+        send({ id: message.id, result: {} });
+        break;
+      }
+
+      case "thread/unarchive": {
+        const thread = ensureThread(state, message.params.threadId);
+        if (!thread.archived) {
+          throw new Error("session " + thread.id + " is not archived");
+        }
+        thread.archived = false;
+        thread.updatedAt = now();
+        saveState(state);
+        send({ id: message.id, result: {} });
+        break;
+      }
+
       case "thread/list": {
         let threads = state.threads.slice();
+        threads = message.params.archived === true
+          ? threads.filter((thread) => thread.archived === true)
+          : threads.filter((thread) => thread.archived !== true);
         if (message.params.cwd) {
           threads = threads.filter((thread) => thread.cwd === message.params.cwd);
         }
@@ -410,6 +438,9 @@ rl.on("line", (line) => {
           throw new Error("thread/resume.persistFullHistory requires experimentalApi capability");
         }
         const thread = ensureThread(state, message.params.threadId);
+        if (thread.archived) {
+          throw new Error("session " + thread.id + " is archived. Run codex unarchive " + thread.id + " to unarchive it first.");
+        }
         thread.updatedAt = now();
         saveState(state);
 	        const selectedModel = message.params.model || thread.model || "gpt-5.4";

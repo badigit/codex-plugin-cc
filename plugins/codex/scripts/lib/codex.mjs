@@ -998,6 +998,46 @@ async function resumeThread(client, threadId, cwd, options = {}) {
   return client.request("thread/resume", buildResumeParams(threadId, cwd, options));
 }
 
+// [dim] Escape hatch for anyone who WANTS delegated runs in the Codex session
+// list — same env-var shape as CODEX_TASK_THREAD_PREFIX.
+const KEEP_THREADS_VISIBLE_ENV = "CODEX_COMPANION_KEEP_THREADS_VISIBLE";
+
+export function keepThreadsVisible(env = process.env) {
+  const raw = String(env[KEEP_THREADS_VISIBLE_ENV] ?? "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+}
+
+// A persisted delegated thread is not a session the human started, but Codex has
+// no way to say so: the source kind is derived from the transport (every one of
+// ours lands as "vscode"), thread/start silently ignores a client-supplied
+// `sourceKind`, and `threadSource` is analytics only — no list filter reads it.
+// Archiving is the one mechanism that actually removes a thread from the default
+// list while keeping it on disk and resumable, so that is what we use.
+//
+// Best-effort by design: an older CLI without the method, or a thread the server
+// refuses to archive, must not fail a run whose work is already done.
+async function archiveThreadQuietly(client, threadId, onProgress) {
+  try {
+    await client.request("thread/archive", { threadId });
+    return true;
+  } catch (error) {
+    emitProgress(onProgress, `Could not archive thread ${threadId}: ${error?.message ?? error}`, "running");
+    return false;
+  }
+}
+
+// Resuming an archived thread is refused outright ("session … is archived"), so
+// every resume has to lift the archive first. Failure is not fatal here either:
+// a thread that was never archived answers with an error, and the resume that
+// follows is the real check.
+async function unarchiveThreadQuietly(client, threadId) {
+  try {
+    await client.request("thread/unarchive", { threadId });
+  } catch {
+    // Not archived, or an older CLI without the method — let the resume decide.
+  }
+}
+
 function buildResultStatus(turnState) {
   return turnState.finalTurn?.status === "completed" ? 0 : 1;
 }
@@ -1410,6 +1450,7 @@ export async function runAppServerTurn(cwd, options = {}) {
 
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
+      await unarchiveThreadQuietly(client, options.resumeThreadId);
       response = await resumeThread(client, options.resumeThreadId, cwd, {
         model: options.model,
         sandbox: options.sandbox,
@@ -1482,6 +1523,15 @@ export async function runAppServerTurn(cwd, options = {}) {
       }
     );
 
+    // Persisted threads only: an ephemeral one was never on disk and is not in
+    // any list to begin with. Archive AFTER the turn, never before — the server
+    // refuses to resume an archived thread, so archiving early would break a
+    // run mid-flight.
+    const persisted = options.persistThread === true || Boolean(options.resumeThreadId);
+    if (persisted && !keepThreadsVisible()) {
+      await archiveThreadQuietly(client, threadId, options.onProgress);
+    }
+
     return {
       status: buildResultStatus(turnState),
       threadId,
@@ -1505,18 +1555,38 @@ export async function findLatestTaskThread(cwd) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
 
+  // Two server-side filters were dropped here because both match NOTHING,
+  // silently (probed against codex 0.146.0):
+  //   - sourceKinds: ["appServer"] — our threads are recorded as "vscode". The
+  //     kind comes from the transport, not from clientInfo, and no appServer
+  //     thread exists on a machine that has run hundreds of delegated tasks.
+  //   - cwd — `searchTerm` alone finds a thread whose own `cwd` is exactly the
+  //     value passed; adding `cwd` to the same call returns zero. The stored
+  //     column the filter reads is not the one thread.cwd is repaired from.
+  // Both are applied in JS below instead, where they can be verified.
+  //
+  // Archived threads are listed too: once a completed run is archived, the
+  // default (non-archived) listing can no longer see any of our own work.
   return withAppServer(cwd, async (client) => {
-    const response = await client.request("thread/list", {
-      cwd,
-      limit: 20,
-      sortKey: "updated_at",
-      sourceKinds: ["appServer"],
-      searchTerm: taskThreadSearchTerm()
-    });
+    const listParams = { limit: 40, sortKey: "updated_at", searchTerm: taskThreadSearchTerm() };
+    const [visible, archived] = await Promise.all([
+      client.request("thread/list", listParams),
+      client.request("thread/list", { ...listParams, archived: true }).catch(() => ({ data: [] }))
+    ]);
+
+    const matchesCwd = (thread) => !thread.cwd || pathsEqual(thread.cwd, cwd);
 
     return (
-      response.data.find((thread) => isTaskThreadName(thread.name)) ??
-      null
+      [...visible.data, ...archived.data]
+        .filter((thread) => isTaskThreadName(thread.name) && matchesCwd(thread))
+        .sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0))[0] ?? null
     );
   });
+}
+
+// Windows: the same directory reaches us as both "C:\\x\\y" and "C:/x/y", and
+// case differs between what the shell hands over and what Codex stored.
+function pathsEqual(left, right) {
+  const normalize = (value) => String(value ?? "").replace(/[\\/]+/g, "/").replace(/\/+$/, "").toLowerCase();
+  return normalize(left) === normalize(right);
 }

@@ -134,3 +134,34 @@ test("an override sharing nothing with the stock prefixes collapses the search t
     assert.ok(isTaskThreadName("Codex Companion Task: legacy"));
   });
 });
+
+test("имя треда не тратит бюджет на обёртку вызывающего", () => {
+  // Реальное имя из session_index.jsonl этой машины: тег съедал 7 символов из 56.
+  assert.equal(
+    buildPersistentTaskThreadName("<task> Критическое ревью диапазона git diff", "rescue"),
+    "Codex Rescue: Критическое ревью диапазона git diff"
+  );
+  assert.equal(
+    buildPersistentTaskThreadName("<task>fix the flaky test</task>"),
+    "Codex Task: fix the flaky test"
+  );
+  assert.equal(
+    buildPersistentTaskThreadName("<task>\n<context>расследуй падение</context>\n</task>"),
+    "Codex Task: расследуй падение"
+  );
+});
+
+test("обрезаются только краевые теги, обобщённые типы внутри промпта целы", () => {
+  assert.equal(
+    buildPersistentTaskThreadName("почини Vec<String> в парсере"),
+    "Codex Task: почини Vec<String> в парсере"
+  );
+  assert.equal(
+    buildPersistentTaskThreadName("<task>почини Vec<String> в парсере</task>"),
+    "Codex Task: почини Vec<String> в парсере"
+  );
+});
+
+test("промпт из одних тегов не превращается в мусорное имя", () => {
+  assert.equal(buildPersistentTaskThreadName("<task></task>", "rescue"), "Codex Rescue");
+});

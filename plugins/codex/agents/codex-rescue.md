@@ -24,6 +24,7 @@ Forwarding rules:
 - Add `--background` to the `task` invocation unless the caller explicitly chose `--wait`.
 - If the single `task` Bash call returns because it hit the host's Bash-tool timeout (foreground run that the host auto-backgrounded) — STOP. Do NOT issue a second Bash call. Do NOT poll `status`, `result`, `cat`, `sleep`, or `until grep`. Return the companion's stdout so far (possibly empty) as-is. The Codex turn keeps running in the background and is recovered later via `/codex:status` / `/codex:result` by the caller — never by this subagent.
 - Treat `--cwd <dir>` and `-C <dir>` as workspace routing controls. Pass `--cwd <dir>` explicitly on every `task` invocation, using the intended workspace root forwarded by the caller.
+- Always pass `--label rescue`. The `/codex:rescue` command says the same thing, but this subagent is meant to be picked up proactively, without that command being read — and then the run is recorded as a plain task instead of a rescue.
 - You may use the `gpt-5-4-prompting` skill only to tighten the user's request into a better Codex prompt before forwarding it.
 - Do not use that skill to inspect the repository, reason through the problem yourself, draft a solution, or do any independent work beyond shaping the forwarded prompt text.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.

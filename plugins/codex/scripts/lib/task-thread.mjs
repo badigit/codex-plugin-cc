@@ -93,8 +93,29 @@ export function taskThreadSearchTerm() {
   return common;
 }
 
+// [dim] Callers wrap the forwarded request in tags — `<task>…</task>` is what the
+// rescue command produces. Those tags are pure plumbing, and with only 56
+// characters of budget they cost a fifth of the one thing a human reads in the
+// session list: "Codex Rescue: <task> Критическое ревью диапазона `git diff…".
+//
+// Only edge tags are stripped, repeatedly, from both ends. A blanket
+// tag-stripping regex would also eat `Vec<String>` or `List<Foo>` out of the
+// middle of a prompt, which is the opposite of readable.
+function stripWrapperTags(text) {
+  let value = String(text ?? "").trim();
+  let previous;
+  do {
+    previous = value;
+    value = value
+      .replace(/^<\/?[a-zA-Z][a-zA-Z0-9_-]*(?:\s[^>]*)?>/, "")
+      .replace(/<\/[a-zA-Z][a-zA-Z0-9_-]*>$/, "")
+      .trim();
+  } while (value !== previous);
+  return value;
+}
+
 function shorten(text, limit) {
-  const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
+  const normalized = stripWrapperTags(text).replace(/\s+/g, " ");
   if (!normalized || normalized.length <= limit) {
     return normalized;
   }
