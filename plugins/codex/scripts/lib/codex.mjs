@@ -44,7 +44,7 @@ import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
-import { validateExplicitReasoningSelection, validateReasoningSelection } from "./model-catalog.mjs";
+import { resolveModelFromCatalog, validateExplicitReasoningSelection, validateReasoningSelection } from "./model-catalog.mjs";
 import { isTaskThreadName, taskThreadSearchTerm } from "./task-thread.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
@@ -1021,14 +1021,46 @@ export function keepThreadsVisible(env = process.env) {
 // уборку, а САМО исключение из captureTurn — в foreground у нас остаётся ~5 с до
 // внешнего SIGKILL после turn/interrupt, и потратить их на молчащий archive
 // значит потерять и ошибку, и ответ.
-const ARCHIVE_REQUEST_TIMEOUT_MS = 4000;
+// Замер на codex 0.153.4: одиночный thread/unarchive занял 5.5 с при 339 мс у
+// archive — разброс большой, и первые 4 с (первая редакция) резали нормальную
+// работу, а не зависание. Дедлайн нужен против МОЛЧАЩЕГО соединения, поэтому
+// он щедрый; поднять ещё выше можно переменной, не трогая код.
+const ARCHIVE_TIMEOUT_ENV = "CODEX_COMPANION_ARCHIVE_TIMEOUT_MS";
+const DEFAULT_ARCHIVE_REQUEST_TIMEOUT_MS = 15000;
+
+function resolveArchiveTimeoutMs(env = process.env) {
+  const raw = Number(env[ARCHIVE_TIMEOUT_ENV]);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_ARCHIVE_REQUEST_TIMEOUT_MS;
+}
+
+// Сразу после хода rollout-файла может ещё не быть на диске: 0.153.4 отвечает
+// "no rollout found for thread id …" на архивацию только что завершённого
+// треда. Это не отказ, а гонка — файл появляется через доли секунды, поэтому
+// одна повторная попытка. Замечено живьём: архивация валилась, и тред
+// оставался в списке при полностью успешном прогоне.
+const ARCHIVE_RETRY_DELAY_MS = 1500;
+
+function isRolloutNotReady(error) {
+  return /no rollout found/i.test(String(error?.message ?? error ?? ""));
+}
 
 async function archiveThreadQuietly(client, threadId, onProgress) {
+  const timeoutMs = resolveArchiveTimeoutMs();
+  const send = () => client.request("thread/archive", { threadId }, {
+    timeoutMs,
+    timeoutMessage: `thread/archive timed out after ${timeoutMs}ms.`
+  });
+
   try {
-    await client.request("thread/archive", { threadId }, {
-      timeoutMs: ARCHIVE_REQUEST_TIMEOUT_MS,
-      timeoutMessage: `thread/archive timed out after ${ARCHIVE_REQUEST_TIMEOUT_MS}ms.`
-    });
+    try {
+      await send();
+    } catch (error) {
+      if (!isRolloutNotReady(error)) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, ARCHIVE_RETRY_DELAY_MS).unref?.());
+      await send();
+    }
     return true;
   } catch (error) {
     // Отчёт о неудаче не имеет права подменить исходную ошибку: onProgress —
@@ -1047,8 +1079,8 @@ async function archiveThreadQuietly(client, threadId, onProgress) {
 async function unarchiveThreadQuietly(client, threadId, onProgress) {
   try {
     await client.request("thread/unarchive", { threadId }, {
-      timeoutMs: ARCHIVE_REQUEST_TIMEOUT_MS,
-      timeoutMessage: `thread/unarchive timed out after ${ARCHIVE_REQUEST_TIMEOUT_MS}ms.`
+      timeoutMs: resolveArchiveTimeoutMs(),
+      timeoutMessage: `thread/unarchive timed out after ${resolveArchiveTimeoutMs()}ms.`
     });
   } catch (error) {
     // «Не в архиве» и «метод неизвестен» — штатные ответы, их глушим молча.
@@ -1476,6 +1508,13 @@ export async function runAppServerTurn(cwd, options = {}) {
   }
 
   return withAppServer(cwd, async (client) => {
+    // Короткое имя модели доразрешаем по каталогу аккаунта ДО старта треда:
+    // иначе сервер отвечает про неизвестную модель, а человек видит только
+    // «прогон упал». Полное имя проходит здесь без изменений.
+    if (options.model) {
+      options = { ...options, model: await resolveModelFromCatalog(client, options.model) };
+    }
+
     let response;
     let threadSelection;
     // Тред, за который мы отвечаем, появляется РАНЬШЕ хода: на resume — с

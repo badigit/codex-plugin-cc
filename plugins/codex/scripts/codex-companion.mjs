@@ -97,12 +97,39 @@ const DEFAULT_TURN_TIMEOUT_MS = 600000;
 const DEFAULT_TURN_HARD_CEILING_MS = 45 * 60 * 1000;
 const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
 const VALID_REASONING_EFFORTS = new Set(REASONING_EFFORTS);
-const MODEL_ALIASES = new Map([
+// Встроенные сокращения. Список моделей у аккаунта меняется быстрее, чем
+// выходят версии плагина — 08.09.2026 дефолтом стала gpt-6-astra, которой
+// установленный CLI ещё не знал, — поэтому он НЕ должен быть единственным
+// способом назвать модель. Их три:
+//   1. полное имя работает всегда: --model gpt-6-astra уходит на сервер как есть;
+//   2. свои сокращения — CODEX_MODEL_ALIASES="astra=gpt-6-astra,mini=gpt-6-mini";
+//   3. короткое имя, не совпавшее ни с чем, доразрешается по каталогу
+//      model/list (см. resolveModelFromCatalog) — новая модель подхватывается
+//      сама, без правки конфига.
+const BUILTIN_MODEL_ALIASES = new Map([
   ["spark", "gpt-5.3-codex-spark"],
   ["sol", "gpt-5.6-sol"],
   ["terra", "gpt-5.6-terra"],
   ["luna", "gpt-5.6-luna"]
 ]);
+const MODEL_ALIASES_ENV = "CODEX_MODEL_ALIASES";
+
+// Формат намеренно примитивный: `имя=модель`, разделители — запятая, точка с
+// запятой или перенос строки. Записи с мусором пропускаем молча: сорвать
+// делегированный прогон из-за лишней запятой в переменной окружения хуже, чем
+// проигнорировать её.
+function modelAliases(env = process.env) {
+  const aliases = new Map(BUILTIN_MODEL_ALIASES);
+  for (const entry of String(env[MODEL_ALIASES_ENV] ?? "").split(/[,;\n]/)) {
+    const [rawAlias, ...rest] = entry.split("=");
+    const alias = String(rawAlias ?? "").trim().toLowerCase();
+    const target = rest.join("=").trim();
+    if (alias && target) {
+      aliases.set(alias, target);
+    }
+  }
+  return aliases;
+}
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function printUsage() {
@@ -141,7 +168,7 @@ function normalizeRequestedModel(model) {
   if (!normalized) {
     return null;
   }
-  return MODEL_ALIASES.get(normalized.toLowerCase()) ?? normalized;
+  return modelAliases().get(normalized.toLowerCase()) ?? normalized;
 }
 
 function normalizeReasoningEffort(effort) {

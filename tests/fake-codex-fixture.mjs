@@ -398,6 +398,13 @@ rl.on("line", (line) => {
 
       case "thread/archive": {
         const thread = ensureThread(state, message.params.threadId);
+        // Настоящий сервер (0.153.4) отвечает так на архивацию треда, чей
+        // rollout ещё не лёг на диск: файл появляется через доли секунды.
+        if (BEHAVIOR === "archive-not-ready-once" && !state.archiveAttempted) {
+          state.archiveAttempted = true;
+          saveState(state);
+          throw new Error("no rollout found for thread id " + thread.id);
+        }
         thread.archived = true;
         thread.updatedAt = now();
         saveState(state);

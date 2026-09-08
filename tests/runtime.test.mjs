@@ -4110,3 +4110,42 @@ test("упавший по потолку прогон тоже уходит из
   assert.equal(persisted.length, 1);
   assert.equal(persisted[0].archived, true, "упавший тред тоже должен быть скрыт");
 });
+
+test("архивация переживает ещё не записанный rollout", () => {
+  // Живой случай на codex 0.153.4: сразу после успешного хода thread/archive
+  // отвечает "no rollout found" — файл ещё не лёг на диск. Первая редакция
+  // сдавалась, и тред оставался в списке при полностью успешном прогоне.
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "archive-not-ready-once");
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--write", "fix the flaky test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const persisted = state.threads.filter((thread) => !thread.ephemeral);
+  assert.equal(persisted.length, 1);
+  assert.equal(persisted[0].archived, true, "повторная попытка обязана добить архивацию");
+});
+
+test("CODEX_MODEL_ALIASES добавляет сокращение без правки кода", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--model", "astra", "capture the page"], {
+    cwd: repo,
+    env: { ...buildEnv(binDir), CODEX_MODEL_ALIASES: "astra=gpt-6-astra" }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(state.lastThreadStart.model, "gpt-6-astra");
+});

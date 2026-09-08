@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { validateReasoningSelection } from "../plugins/codex/scripts/lib/model-catalog.mjs";
+import { resolveModelFromCatalog, validateReasoningSelection } from "../plugins/codex/scripts/lib/model-catalog.mjs";
 
 function clientWith(models) {
   return {
@@ -92,4 +92,43 @@ test("catalog does not block custom providers or unknown models", async () => {
     effort: "ultra",
     modelProvider: "openai"
   });
+});
+
+test("короткое имя доразрешается по каталогу аккаунта", async () => {
+  // Ради этого механизм и заведён: 08.09.2026 дефолтом аккаунта стала
+  // gpt-6-astra, которой установленный CLI ещё не знал.
+  const client = clientWith([model("gpt-6-astra", ["low", "high"]), model("gpt-5.6-sol", ["high"])]);
+  assert.equal(await resolveModelFromCatalog(client, "astra"), "gpt-6-astra");
+});
+
+test("полное имя возвращается без изменений", async () => {
+  const client = clientWith([model("gpt-6-astra", ["low"])]);
+  assert.equal(await resolveModelFromCatalog(client, "gpt-6-astra"), "gpt-6-astra");
+});
+
+test("неоднозначное сокращение — ошибка со списком, а не молчаливый выбор", async () => {
+  // Потратить делегированный прогон не на той модели и узнать об этом из счёта
+  // хуже, чем получить отказ.
+  const client = clientWith([model("gpt-6-astra", ["low"]), model("gpt-6-astra-mini", ["low"])]);
+  await assert.rejects(
+    () => resolveModelFromCatalog(client, "astra"),
+    /matches several catalog entries: gpt-6-astra, gpt-6-astra-mini/
+  );
+});
+
+test("неизвестное имя уходит на сервер как есть", async () => {
+  // Ошибка сервера про неизвестную модель понятнее нашей догадки.
+  const client = clientWith([model("gpt-6-astra", ["low"])]);
+  assert.equal(await resolveModelFromCatalog(client, "gpt-9-nope"), "gpt-9-nope");
+});
+
+test("старый CLI без model/list не ломает запуск", async () => {
+  const client = {
+    async request() {
+      const error = new Error("Unsupported method: model/list");
+      error.rpcCode = -32601;
+      throw error;
+    }
+  };
+  assert.equal(await resolveModelFromCatalog(client, "astra"), "astra");
 });
