@@ -106,10 +106,22 @@ function stripWrapperTags(text) {
   let previous;
   do {
     previous = value;
-    value = value
-      .replace(/^<\/?[a-zA-Z][a-zA-Z0-9_-]*(?:\s[^>]*)?>/, "")
-      .replace(/<\/[a-zA-Z][a-zA-Z0-9_-]*>$/, "")
-      .trim();
+    // Снимаем только СОГЛАСОВАННУЮ пару <tag>…</tag>: имя закрывающего тега
+    // обязано совпасть с открывающим. Прежняя редакция срезала любые краевые
+    // теги по отдельности, и `<task>keep this</context>` превращалось в
+    // `keep this` — а строка, законно начинающаяся с `<div>` или `<String>`,
+    // теряла начало просто потому, что оно у края.
+    const pair = value.match(/^<([a-zA-Z][a-zA-Z0-9_-]*)(?:\s[^>]*)?>([\s\S]*)<\/\1>$/);
+    if (pair) {
+      value = pair[2].trim();
+      continue;
+    }
+    // Незакрытая обёртка — ровно то, что шлёт rescue: `<task>` в начале и
+    // никакого закрывающего тега, потому что промпт длиннее имени.
+    const open = value.match(/^<([a-zA-Z][a-zA-Z0-9_-]*)(?:\s[^>]*)?>([\s\S]*)$/);
+    if (open && !value.includes(`</${open[1]}>`)) {
+      value = open[2].trim();
+    }
   } while (value !== previous);
   return value;
 }

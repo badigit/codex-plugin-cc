@@ -1016,12 +1016,26 @@ export function keepThreadsVisible(env = process.env) {
 //
 // Best-effort by design: an older CLI without the method, or a thread the server
 // refuses to archive, must not fail a run whose work is already done.
+// Собственный дедлайн обязателен: client.request() без timeoutMs ждёт вечно, а
+// этот вызов стоит в finally. Живое, но замолчавшее соединение подвесило бы не
+// уборку, а САМО исключение из captureTurn — в foreground у нас остаётся ~5 с до
+// внешнего SIGKILL после turn/interrupt, и потратить их на молчащий archive
+// значит потерять и ошибку, и ответ.
+const ARCHIVE_REQUEST_TIMEOUT_MS = 4000;
+
 async function archiveThreadQuietly(client, threadId, onProgress) {
   try {
-    await client.request("thread/archive", { threadId });
+    await client.request("thread/archive", { threadId }, {
+      timeoutMs: ARCHIVE_REQUEST_TIMEOUT_MS,
+      timeoutMessage: `thread/archive timed out after ${ARCHIVE_REQUEST_TIMEOUT_MS}ms.`
+    });
     return true;
   } catch (error) {
-    emitProgress(onProgress, `Could not archive thread ${threadId}: ${error?.message ?? error}`, "running");
+    // Отчёт о неудаче не имеет права подменить исходную ошибку: onProgress —
+    // чужой колбэк, и его исключение вылетело бы ИЗ finally вместо неё.
+    try {
+      emitProgress(onProgress, `Could not archive thread ${threadId}: ${error?.message ?? error}`, "running");
+    } catch {}
     return false;
   }
 }
@@ -1030,11 +1044,24 @@ async function archiveThreadQuietly(client, threadId, onProgress) {
 // every resume has to lift the archive first. Failure is not fatal here either:
 // a thread that was never archived answers with an error, and the resume that
 // follows is the real check.
-async function unarchiveThreadQuietly(client, threadId) {
+async function unarchiveThreadQuietly(client, threadId, onProgress) {
   try {
-    await client.request("thread/unarchive", { threadId });
-  } catch {
-    // Not archived, or an older CLI without the method — let the resume decide.
+    await client.request("thread/unarchive", { threadId }, {
+      timeoutMs: ARCHIVE_REQUEST_TIMEOUT_MS,
+      timeoutMessage: `thread/unarchive timed out after ${ARCHIVE_REQUEST_TIMEOUT_MS}ms.`
+    });
+  } catch (error) {
+    // «Не в архиве» и «метод неизвестен» — штатные ответы, их глушим молча.
+    // Всё остальное (права, транспорт, порча состояния) сообщаем: иначе
+    // первопричина теряется, и наружу выходит только вторичное «session … is
+    // archived» от следующего resume.
+    const message = String(error?.message ?? error ?? "");
+    if (/not archived|unknown (variant|method)/i.test(message)) {
+      return;
+    }
+    try {
+      emitProgress(onProgress, `Could not unarchive thread ${threadId}: ${message}`, "starting");
+    } catch {}
   }
 }
 
@@ -1303,9 +1330,19 @@ export async function interruptAppServerTurn(cwd, options = {}) {
       // beyond resolvedTimeoutMs regardless of transport.
       onTimeout: () => client?.close().catch(() => {})
     });
+    // Архивируем ТЕМ ЖЕ соединением: отдельный connect поднял бы второй
+    // app-server, а отмена обязана обходиться одним (tests/runtime.test.mjs —
+    // "cancel sends turn interrupt to the shared app-server", appServerStarts=1).
+    // Убирать за прогоном приходится здесь, потому что вызывающий сейчас же
+    // погасит worker через terminateProcessTree, и finally внутри него не
+    // выполнится никогда.
+    const archived = options.archiveThread === true && !keepThreadsVisible()
+      ? await archiveThreadQuietly(client, threadId, null)
+      : false;
     return {
       attempted: true,
       interrupted: true,
+      archived,
       transport: client.transport,
       detail: `Interrupted ${turnId} on ${threadId}.`
     };
@@ -1441,7 +1478,14 @@ export async function runAppServerTurn(cwd, options = {}) {
   return withAppServer(cwd, async (client) => {
     let response;
     let threadSelection;
+    // Тред, за который мы отвечаем, появляется РАНЬШЕ хода: на resume — с
+    // момента снятия архива, на старте — с момента thread/start. Ошибка между
+    // этим моментом и ходом (thread/resume, проверка sandbox, валидация
+    // reasoning) раньше оставляла тред расхаканным и видимым.
+    let ownedThreadId = null;
+    const persisted = options.persistThread === true || Boolean(options.resumeThreadId);
 
+    try {
     if (!options.resumeThreadId) {
       await validateExplicitReasoningSelection(client, cwd, options, {
         includeInherited: options.persistThread === true
@@ -1450,7 +1494,8 @@ export async function runAppServerTurn(cwd, options = {}) {
 
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
-      await unarchiveThreadQuietly(client, options.resumeThreadId);
+      ownedThreadId = options.resumeThreadId;
+      await unarchiveThreadQuietly(client, options.resumeThreadId, options.onProgress);
       response = await resumeThread(client, options.resumeThreadId, cwd, {
         model: options.model,
         sandbox: options.sandbox,
@@ -1469,6 +1514,7 @@ export async function runAppServerTurn(cwd, options = {}) {
     }
 
     const threadId = response.thread.id;
+    ownedThreadId = threadId;
     let resolved = {
       model: response.model,
       modelProvider: response.modelProvider,
@@ -1497,9 +1543,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       throw new Error("A prompt is required for this Codex run.");
     }
 
-    let turnState;
-    try {
-      turnState = await captureTurn(
+    const turnState = await captureTurn(
       client,
       threadId,
       () =>
@@ -1523,29 +1567,11 @@ export async function runAppServerTurn(cwd, options = {}) {
           options.onProgress?.({ message: "", resolved });
         }
       }
-      );
-    } finally {
-      // Persisted threads only: an ephemeral one was never on disk and is not
-      // in any list to begin with. Archive AFTER the turn, never before — the
-      // server refuses to resume an archived thread, so archiving early would
-      // break a run mid-flight.
-      //
-      // In `finally`, not after a successful turn: a run that dies on the
-      // wall-clock ceiling or is interrupted leaves a thread behind exactly
-      // like a successful one, and skipping those was enough to leak a thread
-      // back into the session list on the very first day (a foreground rescue
-      // in dimcoder that hit the 110s ceiling). captureTurn has already sent
-      // turn/interrupt by the time it throws, and archiveThreadQuietly
-      // swallows its own failure, so the original error still propagates.
-      const persisted = options.persistThread === true || Boolean(options.resumeThreadId);
-      if (persisted && !keepThreadsVisible()) {
-        await archiveThreadQuietly(client, threadId, options.onProgress);
-      }
-    }
+    );
 
     return {
       status: buildResultStatus(turnState),
-      threadId,
+      threadId: ownedThreadId ?? threadId,
       turnId: turnState.turnId,
       resolved,
       finalMessage: turnState.lastAgentMessage,
@@ -1557,6 +1583,22 @@ export async function runAppServerTurn(cwd, options = {}) {
       touchedFiles: collectTouchedFiles(turnState.fileChanges),
       commandExecutions: turnState.commandExecutions
     };
+    } finally {
+      // Только персистентные треды: эфемерный никогда не попадал на диск и ни в
+      // один список. Архивируем ПОСЛЕ хода, никогда до — сервер отказывается
+      // резюмить архивный тред, так что ранняя архивация сломала бы прогон на
+      // лету.
+      //
+      // В finally, а не на пути успеха: прогон, убитый потолком wall-clock или
+      // прерванный, оставляет тред ровно так же, как успешный. Пропуск этих
+      // случаев в первый же день вернул тред в общий список (foreground-rescue
+      // в dimcoder, 110 с). К моменту броска captureTurn уже отправил
+      // turn/interrupt, а archiveThreadQuietly глушит свою ошибку и имеет
+      // собственный дедлайн — исходное исключение доходит нетронутым.
+      if (ownedThreadId && persisted && !keepThreadsVisible()) {
+        await archiveThreadQuietly(client, ownedThreadId, options.onProgress);
+      }
+    }
   }, { model: options.model, effort: options.effort });
 }
 
@@ -1578,18 +1620,44 @@ export async function findLatestTaskThread(cwd) {
   //
   // Archived threads are listed too: once a completed run is archived, the
   // default (non-archived) listing can no longer see any of our own work.
-  return withAppServer(cwd, async (client) => {
-    const listParams = { limit: 40, sortKey: "updated_at", searchTerm: taskThreadSearchTerm() };
-    const [visible, archived] = await Promise.all([
-      client.request("thread/list", listParams),
-      client.request("thread/list", { ...listParams, archived: true }).catch(() => ({ data: [] }))
-    ]);
+  // Одной страницы мало: фильтр по cwd теперь применяется НА КЛИЕНТЕ, поэтому
+  // 40 свежих тредов из других рабочих каталогов вытеснили бы нужный, и
+  // --resume-last соврал бы «нет предыдущего треда» при живом треде. Идём по
+  // курсору до первого совпадения, с потолком на число страниц — глубже искать
+  // «последний тред этого репозитория» бессмысленно.
+  const PAGE_SIZE = 40;
+  const MAX_PAGES = 10;
 
+  return withAppServer(cwd, async (client) => {
     const matchesCwd = (thread) => !thread.cwd || pathsEqual(thread.cwd, cwd);
+    const mine = (thread) => isTaskThreadName(thread.name) && matchesCwd(thread);
+
+    async function scan(archived) {
+      const found = [];
+      let cursor = null;
+      for (let page = 0; page < MAX_PAGES; page += 1) {
+        const params = { limit: PAGE_SIZE, sortKey: "updated_at", searchTerm: taskThreadSearchTerm() };
+        if (cursor) params.cursor = cursor;
+        if (archived) params.archived = true;
+        let response;
+        try {
+          response = await client.request("thread/list", params);
+        } catch {
+          break;
+        }
+        found.push(...response.data.filter(mine));
+        cursor = response.nextCursor;
+        if (found.length > 0 || !cursor || response.data.length === 0) {
+          break;
+        }
+      }
+      return found;
+    }
+
+    const [visible, archived] = await Promise.all([scan(false), scan(true)]);
 
     return (
-      [...visible.data, ...archived.data]
-        .filter((thread) => isTaskThreadName(thread.name) && matchesCwd(thread))
+      [...visible, ...archived]
         .sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0))[0] ?? null
     );
   });
@@ -1599,5 +1667,17 @@ export async function findLatestTaskThread(cwd) {
 // case differs between what the shell hands over and what Codex stored.
 function pathsEqual(left, right) {
   const normalize = (value) => String(value ?? "").replace(/[\\/]+/g, "/").replace(/\/+$/, "").toLowerCase();
-  return normalize(left) === normalize(right);
+  if (normalize(left) === normalize(right)) {
+    return true;
+  }
+  // Один и тот же checkout приходит и как C:\real\repo, и как junction
+  // C:\work\repo — на этой машине junction'ы штатный способ подключения.
+  // После отказа от серверного cwd-фильтра это единственное сравнение
+  // каталогов, поэтому текстового совпадения мало. realpath бросает, когда
+  // каталога уже нет, — тогда остаёмся на текстовом ответе.
+  try {
+    return normalize(fs.realpathSync.native(String(left))) === normalize(fs.realpathSync.native(String(right)));
+  } catch {
+    return false;
+  }
 }

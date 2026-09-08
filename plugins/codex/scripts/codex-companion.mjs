@@ -1194,7 +1194,7 @@ async function handleCancel(argv) {
   // back only after the await returns leaves a false-cancelled state on disk if
   // the process is killed or crashes while still awaiting it.
   if (isOrphan) {
-    const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+    const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId, archiveThread: true });
     if (interrupt.attempted) {
       appendLogLine(
         job.logFile,
@@ -1211,6 +1211,10 @@ async function handleCancel(argv) {
     }
     const nextJob = persistCancellation(null);
     appendLogLine(job.logFile, "Cancelled by user.");
+    // У осиротевшей задачи worker'а нет вовсе — тред убрал сам interrupt.
+    if (interrupt.archived) {
+      upsertJob(cwd, { id: job.id, threadArchived: true });
+    }
     const payload = {
       jobId: job.id,
       status: "cancelled",
@@ -1225,7 +1229,7 @@ async function handleCancel(argv) {
   persistCancellation(job.pid ?? null);
   appendLogLine(job.logFile, "Cancelled by user.");
 
-  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId, archiveThread: true });
   if (interrupt.attempted) {
     appendLogLine(
       job.logFile,
@@ -1256,6 +1260,12 @@ async function handleCancel(argv) {
   }
 
   const nextJob = persistCancellation(null);
+
+  // terminateProcessTree выше убил worker, а значит его finally с архивацией
+  // треда не выполнится никогда — тред убрал interrupt тем же соединением.
+  if (interrupt.archived) {
+    upsertJob(cwd, { id: job.id, threadArchived: true });
+  }
 
   const payload = {
     jobId: job.id,
