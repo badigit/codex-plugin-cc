@@ -1497,7 +1497,9 @@ export async function runAppServerTurn(cwd, options = {}) {
       throw new Error("A prompt is required for this Codex run.");
     }
 
-    const turnState = await captureTurn(
+    let turnState;
+    try {
+      turnState = await captureTurn(
       client,
       threadId,
       () =>
@@ -1521,15 +1523,24 @@ export async function runAppServerTurn(cwd, options = {}) {
           options.onProgress?.({ message: "", resolved });
         }
       }
-    );
-
-    // Persisted threads only: an ephemeral one was never on disk and is not in
-    // any list to begin with. Archive AFTER the turn, never before — the server
-    // refuses to resume an archived thread, so archiving early would break a
-    // run mid-flight.
-    const persisted = options.persistThread === true || Boolean(options.resumeThreadId);
-    if (persisted && !keepThreadsVisible()) {
-      await archiveThreadQuietly(client, threadId, options.onProgress);
+      );
+    } finally {
+      // Persisted threads only: an ephemeral one was never on disk and is not
+      // in any list to begin with. Archive AFTER the turn, never before — the
+      // server refuses to resume an archived thread, so archiving early would
+      // break a run mid-flight.
+      //
+      // In `finally`, not after a successful turn: a run that dies on the
+      // wall-clock ceiling or is interrupted leaves a thread behind exactly
+      // like a successful one, and skipping those was enough to leak a thread
+      // back into the session list on the very first day (a foreground rescue
+      // in dimcoder that hit the 110s ceiling). captureTurn has already sent
+      // turn/interrupt by the time it throws, and archiveThreadQuietly
+      // swallows its own failure, so the original error still propagates.
+      const persisted = options.persistThread === true || Boolean(options.resumeThreadId);
+      if (persisted && !keepThreadsVisible()) {
+        await archiveThreadQuietly(client, threadId, options.onProgress);
+      }
     }
 
     return {

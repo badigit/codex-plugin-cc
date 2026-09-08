@@ -4088,3 +4088,25 @@ test("--resume-last снимает архив и продолжает тот ж�
   assert.equal(persisted[0].id, started[0].id);
   assert.equal(persisted[0].archived, true, "после продолжения тред снова скрыт");
 });
+
+test("упавший по потолку прогон тоже уходит из списка сессий", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "long-progress-hits-wall-clock-ceiling");
+  initGitRepo(repo);
+
+  // Реальный случай 05.09.2026: rescue в dimcoder упёрся в потолок 110с,
+  // captureTurn бросил — и тред остался висеть в списке, потому что архивация
+  // стояла ПОСЛЕ успешного хода.
+  const result = run("node", [SCRIPT, "task", "--turn-timeout-ms", "2000", "test prompt"], {
+    cwd: repo,
+    env: { ...buildEnv(binDir), CODEX_TURN_HARD_CEILING_MS: "3500" }
+  });
+
+  assert.notEqual(result.status, 0, "прогон обязан упасть по потолку");
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const persisted = state.threads.filter((thread) => !thread.ephemeral);
+  assert.equal(persisted.length, 1);
+  assert.equal(persisted[0].archived, true, "упавший тред тоже должен быть скрыт");
+});
