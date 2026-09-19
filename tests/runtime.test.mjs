@@ -4133,6 +4133,38 @@ test("архивация переживает ещё не записанный r
   assert.equal(persisted[0].archived, true, "повторная попытка обязана добить архивацию");
 });
 
+test("ревью тоже уходит из списка сессий", () => {
+  // Архивацию в fork.10 получил только путь задач, а ревью идёт своим
+  // (review/start) — и остался видимым: 107 тредов «Codex Review» с
+  // archived=0 в state_5.sqlite против нуля у task и rescue. Скрыть надо и
+  // свой тред, и тот, что review/start заводит сам в режиме detached.
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 1;\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = 2;\n");
+
+  const result = run("node", [SCRIPT, "review"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const state = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.ok(state.threads.length >= 1, "ревью обязано завести тред");
+  for (const thread of state.threads) {
+    // Про неудачу архивации companion пишет строкой "Could not archive thread"
+    // — без неё падение этого теста выглядит как «archived undefined» и
+    // разгадывается заново.
+    assert.equal(thread.archived, true, `тред ${thread.id} остался в списке сессий\n${result.stdout}\n${result.stderr}`);
+  }
+});
+
 test("CODEX_MODEL_ALIASES добавляет сокращение без правки кода", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();

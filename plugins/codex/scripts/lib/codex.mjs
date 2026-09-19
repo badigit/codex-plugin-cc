@@ -1397,6 +1397,17 @@ export async function runAppServerReview(cwd, options = {}) {
   }
 
   return withAppServer(cwd, async (client) => {
+    // Ревью — такой же делегированный прогон, как задача, и его тред обязан
+    // исчезать из списка сессий Codex ровно так же. Архивацию в fork.10
+    // получил только runAppServerTurn, и этот путь остался видимым: 107 тредов
+    // «Codex Review» в state_5.sqlite с archived=0 против нуля у task/rescue.
+    //
+    // Тредов тут ДВА: свой (thread/start) и тот, что заводит сам review/start
+    // (reviewThreadId). Второй в список попадает так же, поэтому набор ведётся
+    // рядом с captureTurn, а не берётся из turnState: при броске хода
+    // turnState не существует, а треды уже есть.
+    const ownedThreadIds = new Set();
+    try {
     await validateExplicitReasoningSelection(client, cwd, options);
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
     const response = await startThread(client, cwd, {
@@ -1407,6 +1418,7 @@ export async function runAppServerReview(cwd, options = {}) {
       threadName: options.threadName ?? buildReviewThreadName(options.target?.label)
     });
     const sourceThreadId = response.thread.id;
+    ownedThreadIds.add(sourceThreadId);
     const resolved = {
       model: response.model,
       modelProvider: response.modelProvider,
@@ -1441,6 +1453,7 @@ export async function runAppServerReview(cwd, options = {}) {
         onResponse(response, state) {
           if (response.reviewThreadId) {
             state.threadIds.add(response.reviewThreadId);
+            ownedThreadIds.add(response.reviewThreadId);
             if (delivery === "detached") {
               state.threadId = response.reviewThreadId;
             }
@@ -1461,6 +1474,18 @@ export async function runAppServerReview(cwd, options = {}) {
       error: turnState.error,
       stderr: cleanCodexStderr(client.stderr)
     };
+    } finally {
+      // После хода, никогда до: сервер отказывается работать с архивным тредом.
+      // В finally, а не на пути успеха, — упавшее и прерванное ревью оставляет
+      // тред в списке ровно так же, как удавшееся. archiveThreadQuietly глушит
+      // свою ошибку и имеет собственный дедлайн, поэтому исходное исключение
+      // доходит нетронутым.
+      if (!keepThreadsVisible()) {
+        for (const threadId of ownedThreadIds) {
+          await archiveThreadQuietly(client, threadId, options.onProgress);
+        }
+      }
+    }
   }, { model: options.model, effort: options.effort });
 }
 
