@@ -21,6 +21,9 @@ const MAX_JOBS = 50;
 // one-shot temp dir per invocation would grow that ACL by one entry every
 // run; reusing the same path lets Codex reuse the SID it already granted.
 const SCRATCH_SANDBOX_DIR_NAME = "scratch";
+const SCRATCH_SANDBOX_LOCK_FILE_NAME = "scratch.lock";
+export const DEFAULT_SCRATCH_SANDBOX_LOCK_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_SCRATCH_SANDBOX_LOCK_POLL_INTERVAL_MS = 2000;
 export const UNREPORTED_PROCESS_EXIT_MESSAGE = "Process exited without reporting.";
 
 function nowIso() {
@@ -74,19 +77,200 @@ export function resolveScratchSandboxDir(cwd) {
   return path.join(resolveStateDir(cwd), SCRATCH_SANDBOX_DIR_NAME);
 }
 
+function normalizePathForCompare(value) {
+  return String(value ?? "").replace(/[\\/]+/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+function realpathOrSelf(candidate) {
+  try {
+    return fs.existsSync(candidate) ? fs.realpathSync.native(candidate) : path.resolve(candidate);
+  } catch {
+    return path.resolve(candidate);
+  }
+}
+
+function isSameOrInside(candidatePath, containerPath) {
+  const normalizedCandidate = normalizePathForCompare(realpathOrSelf(candidatePath));
+  const normalizedContainer = normalizePathForCompare(realpathOrSelf(containerPath));
+  return normalizedCandidate === normalizedContainer || normalizedCandidate.startsWith(`${normalizedContainer}/`);
+}
+
+// Walks every existing path component between `from` (exclusive) and `to`
+// (inclusive) with `fs.lstatSync` — not `fs.statSync`, which would follow a
+// symlink/junction instead of reporting it — and refuses if any of them is a
+// reparse point (Node reports a Windows junction created via
+// `fs.symlinkSync(target, link, "junction")` as `isSymbolicLink() === true`).
+// A junction anywhere on this path could silently redirect a later recursive
+// delete outside the scratch sandbox this function exists to police — see
+// the code-review finding this guards (CRITICAL #2). Also asserts realpath
+// containment as a second, independent check: some exotic reparse-point
+// shapes are not guaranteed to be caught by lstat's isSymbolicLink() alone.
+function assertPathIsPlainDescendant(from, to) {
+  const normalizedFrom = path.resolve(from);
+  const normalizedTo = path.resolve(to);
+  const relative = path.relative(normalizedFrom, normalizedTo);
+  if (!relative || relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error(`Refusing to treat "${to}" as the scratch sandbox directory: it is not inside "${from}".`);
+  }
+
+  const segments = relative.split(path.sep).filter(Boolean);
+  let current = normalizedFrom;
+  for (const segment of segments) {
+    current = path.join(current, segment);
+    if (!fs.existsSync(current)) {
+      continue;
+    }
+    if (fs.lstatSync(current).isSymbolicLink()) {
+      throw new Error(
+        `Refusing to operate on "${to}": "${current}" is a symlink/junction, not a plain directory. The scratch sandbox path must not pass through a reparse point.`
+      );
+    }
+  }
+
+  if (!isSameOrInside(normalizedTo, normalizedFrom)) {
+    throw new Error(`Refusing to operate on "${to}": its real path resolves outside "${from}".`);
+  }
+}
+
+// Neither the plugin's state directory nor the scratch sandbox inside it may
+// resolve into the repository the scratch sandbox exists to keep read-only —
+// if either did (a misconfigured CLAUDE_PLUGIN_DATA, a repo-relative
+// fallback, …), clearing "scratch" would mean clearing part of the
+// repository itself.
+function assertNotInsideRepo(candidatePath, repoRoot, label) {
+  if (isSameOrInside(candidatePath, repoRoot)) {
+    throw new Error(
+      `Refusing to use ${label} "${candidatePath}": it resolves inside the repository "${repoRoot}". The scratch sandbox must live outside the repository it is meant to keep read-only.`
+    );
+  }
+}
+
+function assertScratchDirIsSafeToTouch(stateDir, scratchDir, repoCwd) {
+  assertPathIsPlainDescendant(stateDir, scratchDir);
+  assertNotInsideRepo(stateDir, repoCwd, "the plugin state directory");
+  assertNotInsideRepo(scratchDir, repoCwd, "the scratch sandbox directory");
+}
+
 // Create the scratch sandbox directory if missing, and otherwise clear its
 // CONTENTS before a run — never delete/recreate the directory itself (that
 // would hand Codex a directory it has never granted a writable root to,
 // forcing Windows to mint a fresh synthetic SID; see the comment on
 // SCRATCH_SANDBOX_DIR_NAME above). A previous run's leftovers must not leak
 // into the next one, so this always runs before starting the sandboxed turn.
+//
+// Safety checks run TWICE: once before creating the directory (cheap,
+// catches a repo/state-dir misconfiguration early) and once again
+// immediately before the destructive readdir/rm loop below — the second
+// call is the one that actually guards that loop and must not be skipped or
+// hoisted away, since nothing between the two calls may be trusted to have
+// kept the directory's identity unchanged (code-review finding CRITICAL #2:
+// "проверку повторять непосредственно перед самой очисткой").
 export function resetScratchSandboxDir(cwd) {
+  const stateDir = resolveStateDir(cwd);
   const dir = resolveScratchSandboxDir(cwd);
+  assertScratchDirIsSafeToTouch(stateDir, dir, cwd);
   fs.mkdirSync(dir, { recursive: true });
+
+  assertScratchDirIsSafeToTouch(stateDir, dir, cwd);
   for (const entry of fs.readdirSync(dir)) {
     fs.rmSync(path.join(dir, entry), { recursive: true, force: true });
   }
   return dir;
+}
+
+function resolveScratchSandboxLockFile(cwd) {
+  return path.join(resolveStateDir(cwd), SCRATCH_SANDBOX_LOCK_FILE_NAME);
+}
+
+function readScratchSandboxLockOwner(lockFile) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(lockFile, "utf8"));
+    return {
+      pid: Number.isInteger(raw?.pid) ? raw.pid : null,
+      jobId: typeof raw?.jobId === "string" ? raw.jobId : null
+    };
+  } catch {
+    return { pid: null, jobId: null };
+  }
+}
+
+// Serializes access to the shared, per-repository scratch sandbox directory
+// across concurrent `task --scratch-sandbox` runs on the same repository —
+// the directory is intentionally a FIXED path (see SCRATCH_SANDBOX_DIR_NAME
+// above), so two jobs racing to clear/use it at the same time would corrupt
+// each other's run (code-review finding IMPORTANT #4). Held for the whole
+// "clear scratch → turn finished" interval by the caller (see
+// codex-companion.mjs's executeTaskRun).
+//
+// Waits up to `timeoutMs` (default 10 minutes), polling every
+// `pollIntervalMs` (default 2s), for the current holder to release the lock
+// or die — a dead holder's lock (pid no longer alive) is reclaimed
+// immediately, without waiting out the remaining timeout. Returns a release
+// function; the caller MUST call it (normally from a `finally`) once done.
+export async function acquireScratchSandboxLock(cwd, jobId, options = {}) {
+  const lockFile = resolveScratchSandboxLockFile(cwd);
+  const envTimeoutMs = Number(process.env.CODEX_COMPANION_SCRATCH_LOCK_TIMEOUT_MS);
+  const timeoutMs =
+    Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+      ? options.timeoutMs
+      : Number.isFinite(envTimeoutMs) && envTimeoutMs > 0
+        ? envTimeoutMs
+        : DEFAULT_SCRATCH_SANDBOX_LOCK_TIMEOUT_MS;
+  const envPollIntervalMs = Number(process.env.CODEX_COMPANION_SCRATCH_LOCK_POLL_INTERVAL_MS);
+  const pollIntervalMs =
+    Number.isFinite(options.pollIntervalMs) && options.pollIntervalMs > 0
+      ? options.pollIntervalMs
+      : Number.isFinite(envPollIntervalMs) && envPollIntervalMs > 0
+        ? envPollIntervalMs
+        : DEFAULT_SCRATCH_SANDBOX_LOCK_POLL_INTERVAL_MS;
+  const deadline = Date.now() + timeoutMs;
+
+  ensureStateDir(cwd);
+
+  for (;;) {
+    try {
+      fs.writeFileSync(
+        lockFile,
+        JSON.stringify({ pid: process.pid, jobId: jobId ?? null, createdAt: nowIso() }),
+        { flag: "wx" }
+      );
+      return () => {
+        try {
+          const owner = readScratchSandboxLockOwner(lockFile);
+          if (owner.pid === process.pid) {
+            fs.unlinkSync(lockFile);
+          }
+        } catch {
+          // Best-effort: a lock file already gone (or now owned by someone
+          // else, which should not happen but must not throw out of a
+          // cleanup path either way) is not an error here.
+        }
+      };
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+    }
+
+    const owner = readScratchSandboxLockOwner(lockFile);
+    if (!owner.pid || !isProcessAlive(owner.pid)) {
+      try {
+        fs.unlinkSync(lockFile);
+      } catch {
+        // Raced with someone else already clearing the stale lock — fine,
+        // just retry the acquire above.
+      }
+      continue;
+    }
+
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `The scratch sandbox for this repository is busy with job ${owner.jobId ?? "unknown"} (pid ${owner.pid}). Timed out after ${timeoutMs}ms waiting for it to finish.`
+      );
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+  }
 }
 
 export function loadState(cwd) {

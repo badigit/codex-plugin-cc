@@ -19,6 +19,7 @@ import {
   runAppServerTurn
 } from "./lib/codex.mjs";
 import { parseStructuredOutput, readOutputSchema } from "./lib/structured-output.mjs";
+import { validateScratchSandboxThreadStart } from "./lib/scratch-sandbox.mjs";
 import { buildPersistentTaskThreadName, DEFAULT_CONTINUE_PROMPT, normalizeTaskLabel, TASK_THREAD_LABELS } from "./lib/task-thread.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
@@ -26,6 +27,7 @@ import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
+  acquireScratchSandboxLock,
   generateJobId,
   getConfig,
   listJobs,
@@ -157,7 +159,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|terra|luna>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--read-only] [--scratch-sandbox] [--cwd <dir>] [--prompt-file <path>] [--output-schema <path>] [--resume-last|--resume|--fresh] [--label <task|review|rescue>] [--model <model|spark|sol|terra|luna>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [prompt]",
       "    --output-schema forwards a JSON Schema to Codex's structured output; `result --json`/`task --json` then carry the parsed answer as `structured`. The companion only JSON.parses the answer — schema conformance is enforced by Codex's own strict structured-output mode, not validated here.",
-      "    --scratch-sandbox runs Codex with a workspace-write sandbox rooted at a per-repository scratch directory instead of the repository itself, with TEMP/TMP pointed there too — for running the repo's own tests, which often need a writable temp dir even under a read-only review. The repository stays read-only (reachable via `cd <repo>` inside the sandbox); combine with --write to write to the repository is rejected.",
+      "    --scratch-sandbox runs Codex with a workspace-write sandbox rooted at a per-repository scratch directory instead of the repository itself, with TEMP/TMP pointed there too — for running the repo's own tests, which often need a writable temp dir even under a read-only review. Self-contained: the repository stays read-only (reachable via `cd <repo>` inside the sandbox) on its own, so it takes neither --write nor --read-only, and only supports a fresh task (not --resume/--resume-last).",
       "  node scripts/codex-companion.mjs prompt-path [--cwd <dir>] [--label <name>] [--json]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
@@ -629,36 +631,68 @@ async function executeTaskRun(request) {
   // so tempfile-based tests get a writable temp dir under the sandbox, and
   // the prompt is told where the real repository is and that it is
   // read-only. The repository itself is never made a writable root here.
+  //
+  // A fresh thread only: `--scratch-sandbox` is rejected together with
+  // `--resume`/`--resume-last` before this function is ever reached (see
+  // handleTask) — thread/resume keeps a loaded thread's own sandbox and does
+  // not honor most of what this mode overrides, so the guarantee the flag
+  // makes cannot be kept on a resumed thread. codex.mjs's runAppServerTurn
+  // also refuses that combination itself as a second guard.
   let runCwd = workspaceRoot;
   let envOverrides;
   let writableRoots;
   let promptForRun = request.prompt;
+  let assertThreadStartHonored;
+  let sandboxEffective = null;
+  let releaseScratchLock = null;
+  let result;
+
   if (request.scratchSandbox) {
-    const scratchDir = resetScratchSandboxDir(workspaceRoot);
-    runCwd = scratchDir;
-    envOverrides = { TEMP: scratchDir, TMP: scratchDir };
-    writableRoots = [scratchDir];
-    if (request.prompt) {
-      promptForRun = `${buildScratchSandboxPreamble(workspaceRoot)}\n\n${request.prompt}`;
-    }
+    // The scratch directory is a FIXED path per repository (see
+    // resolveScratchSandboxDir), so two `--scratch-sandbox` jobs on the same
+    // repository running at once would race on clearing/using it — held for
+    // the whole "clear scratch → turn finished" interval, released in the
+    // `finally` below (code-review finding IMPORTANT #4).
+    releaseScratchLock = await acquireScratchSandboxLock(workspaceRoot, request.jobId, {
+      timeoutMs: request.scratchLockTimeoutMs,
+      pollIntervalMs: request.scratchLockPollIntervalMs
+    });
   }
 
-  const result = await runAppServerTurn(runCwd, {
-    resumeThreadId,
-    prompt: promptForRun,
-    defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
-    model: request.model,
-    effort: request.effort,
-    sandbox: request.scratchSandbox ? "workspace-write" : request.write ? "workspace-write" : request.readOnly ? "read-only" : null,
-    envOverrides,
-    writableRoots,
-    outputSchema: request.outputSchema ?? null,
-    onProgress: request.onProgress,
-    persistThread: true,
-    turnTimeoutMs: request.turnTimeoutMs,
-    hardCeilingMs: request.hardCeilingMs,
-    threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT, request.label)
-  });
+  try {
+    if (request.scratchSandbox) {
+      const scratchDir = resetScratchSandboxDir(workspaceRoot);
+      runCwd = scratchDir;
+      envOverrides = { TEMP: scratchDir, TMP: scratchDir };
+      writableRoots = [scratchDir];
+      assertThreadStartHonored = (response) => {
+        sandboxEffective = validateScratchSandboxThreadStart(response, { scratchDir, repoRoot: workspaceRoot });
+      };
+      if (request.prompt) {
+        promptForRun = `${buildScratchSandboxPreamble(workspaceRoot)}\n\n${request.prompt}`;
+      }
+    }
+
+    result = await runAppServerTurn(runCwd, {
+      resumeThreadId,
+      prompt: promptForRun,
+      defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
+      model: request.model,
+      effort: request.effort,
+      sandbox: request.scratchSandbox ? "workspace-write" : request.write ? "workspace-write" : request.readOnly ? "read-only" : null,
+      envOverrides,
+      writableRoots,
+      assertThreadStartHonored,
+      outputSchema: request.outputSchema ?? null,
+      onProgress: request.onProgress,
+      persistThread: true,
+      turnTimeoutMs: request.turnTimeoutMs,
+      hardCeilingMs: request.hardCeilingMs,
+      threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT, request.label)
+    });
+  } finally {
+    releaseScratchLock?.();
+  }
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
   const failureMessage = result.error?.message ?? result.stderr ?? "";
@@ -679,7 +713,12 @@ async function executeTaskRun(request) {
     threadId: result.threadId,
     rawOutput,
     touchedFiles: result.touchedFiles,
-    reasoningSummary: result.reasoningSummary
+    reasoningSummary: result.reasoningSummary,
+    // Only present for --scratch-sandbox: the sandbox policy the app-server
+    // actually resolved for the run (see validateScratchSandboxThreadStart),
+    // not just what was requested — surfaced via `result --json` per
+    // code-review finding IMPORTANT #7.
+    ...(sandboxEffective ? { sandboxEffective } : {})
   };
   // Only attempted when the caller actually asked for structured output —
   // reusing the same parser adversarial-review's turn/start already uses
@@ -1096,9 +1135,34 @@ async function handleTask(argv) {
   if (write && readOnly) {
     throw new Error("Choose either --write or --read-only.");
   }
+  // --scratch-sandbox is a self-contained sandbox mode, not a modifier of
+  // --write/--read-only: it already implies the repository is read-only (the
+  // scratch directory is the sole writable root), so it takes neither flag.
+  // --write is a straightforward contradiction (write to the repository vs.
+  // keep it read-only). --read-only is not a contradiction in EFFECT — the
+  // repository ends up read-only either way — but it IS one in MECHANISM:
+  // plain --read-only pins the Codex sandbox itself to read-only, while
+  // --scratch-sandbox pins it to workspace-write (rooted at scratch) and
+  // gets the repository's read-only-ness from writableRoots instead. Passing
+  // both asks for two different sandbox modes on the same thread, so it is
+  // refused rather than silently picking one.
   const scratchSandbox = Boolean(options["scratch-sandbox"]);
   if (scratchSandbox && write) {
     throw new Error("Choose either --write or --scratch-sandbox (--scratch-sandbox keeps the repository read-only; only the scratch directory is writable).");
+  }
+  if (scratchSandbox && readOnly) {
+    throw new Error("--scratch-sandbox is a self-contained sandbox mode and already keeps the repository read-only; do not combine it with --read-only.");
+  }
+  // A fresh thread only: thread/resume keeps a loaded thread's own sandbox
+  // policy and ignores most of what --scratch-sandbox overrides (see
+  // codex.mjs's runAppServerTurn and validateScratchSandboxThreadStart in
+  // lib/scratch-sandbox.mjs), so the guarantee the flag makes — repository
+  // read-only, scratch the sole writable root — cannot actually be kept on a
+  // resumed thread. Refused here, before any prompt is sent or app-server
+  // connection is made; runAppServerTurn also refuses the combination itself
+  // as a second guard for any other caller.
+  if (scratchSandbox && resumeLast) {
+    throw new Error("--scratch-sandbox only supports a fresh task; it cannot be combined with --resume/--resume-last.");
   }
   // Names the thread in the Codex app's session list. Closed set, because the
   // prefix doubles as the lookup key for --resume-last (see lib/task-thread.mjs).

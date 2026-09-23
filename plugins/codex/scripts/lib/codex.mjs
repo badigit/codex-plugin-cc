@@ -182,7 +182,22 @@ function buildThreadConfigOverrides(options = {}) {
     config.shell_environment_policy = { set: { ...options.envOverrides } };
   }
   if (Array.isArray(options.writableRoots) && options.writableRoots.length > 0) {
-    config.sandbox_workspace_write = { writable_roots: options.writableRoots };
+    config.sandbox_workspace_write = {
+      writable_roots: options.writableRoots,
+      // task --scratch-sandbox is the only caller that sets writableRoots
+      // today, and the whole point of that flag is an airtight boundary:
+      // no network, and no accidental extra writable path sneaking in
+      // through the TEMP/TMP-env-var or /tmp sandbox-exclusion defaults
+      // (TEMP/TMP are already pointed at the scratch dir explicitly above,
+      // so excluding them from the sandbox's own env passthrough closes the
+      // gap where a DIFFERENT unsandboxed temp path could otherwise leak
+      // in). Pinned explicitly rather than left to config.toml's own
+      // defaults, so a host config with network_access=true cannot leak
+      // through into this specific overlay.
+      network_access: false,
+      exclude_tmpdir_env_var: true,
+      exclude_slash_tmp: true
+    };
   }
   return Object.keys(config).length > 0 ? config : null;
 }
@@ -1563,6 +1578,20 @@ export async function runAppServerTurn(cwd, options = {}) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
 
+  // Defense in depth: `assertThreadStartHonored` (see below) only ever runs
+  // on the FRESH-thread path — thread/resume keeps a loaded thread's own
+  // policy and ignores most of the overrides this hook is meant to police
+  // (see assertExplicitSandboxHonored's comment on the same issue for
+  // sandbox specifically). A caller combining the two is a caller asking for
+  // a guarantee this code cannot actually give, so it is refused here before
+  // any app-server connection is made — not just left to whichever CLI
+  // validated the flags upstream (codex-companion.mjs's `task --resume` +
+  // `--scratch-sandbox` check is the primary guard; this is the fallback for
+  // any other caller of this function).
+  if (options.resumeThreadId && typeof options.assertThreadStartHonored === "function") {
+    throw new Error("assertThreadStartHonored is only supported for a fresh thread, not thread/resume.");
+  }
+
   return withAppServer(cwd, async (client) => {
     // Короткое имя модели доразрешаем по каталогу аккаунта ДО старта треда:
     // иначе сервер отвечает про неизвестную модель, а человек видит только
@@ -1625,6 +1654,18 @@ export async function runAppServerTurn(cwd, options = {}) {
     // overrides, so --read-only --resume-last on a write-capable thread would
     // otherwise run with write access — violating the --read-only contract.
     assertExplicitSandboxHonored(options.sandbox, resolved.sandbox);
+    // Fail closed on the app-server's ACTUAL thread/start response, before
+    // turn/start is ever sent — see codex-companion.mjs's
+    // validateScratchSandboxThreadStart for what `task --scratch-sandbox`
+    // checks here (cwd, sandbox type, network access, …) and why: assuming
+    // the policy we asked for is the policy we got is exactly the class of
+    // bug this whole flag exists to close (read the same class of report
+    // about the repository's real %TEMP% this flag was built to fix).
+    // Runs only when the caller supplied a hook — plain task runs
+    // (--write/--read-only/unset) are unaffected.
+    if (!options.resumeThreadId && typeof options.assertThreadStartHonored === "function") {
+      options.assertThreadStartHonored(response);
+    }
     await validateReasoningSelection(client, {
       model: options.model ?? threadSelection.model,
       effort: options.effort ?? threadSelection.reasoningEffort,
