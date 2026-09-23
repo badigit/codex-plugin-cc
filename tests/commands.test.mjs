@@ -150,7 +150,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /thin forwarder only/i);
   assert.match(rescue, /Return the Codex companion stdout verbatim to the user/i);
   assert.match(rescue, /Do not paraphrase, summarize, rewrite, or add commentary before or after it/i);
-  assert.match(rescue, /return that command's stdout as-is/i);
+  assert.match(rescue, /returns that command's stdout as-is/i);
   assert.match(rescue, /Leave `--resume` and `--fresh` in the forwarded request/i);
   assert.match(agent, /--resume/);
   assert.match(agent, /--fresh/);
@@ -161,7 +161,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /A timed-out foreground run is terminal, not a signal to poll/i);
   assert.match(agent, /pass `--cwd <dir>` explicitly/i);
   assert.match(agent, /`--cwd <dir>` and `-C <dir>`.*workspace routing controls/i);
-  assert.match(agent, /Use exactly one `Bash` call/i);
+  assert.match(agent, /Use exactly one `prompt-path` `Bash` call.*and exactly one `task` `Bash` call/i);
   assert.match(agent, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(agent, /Do not call `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);
   assert.match(agent, /Leave `--effort` unset unless the user explicitly requests a specific reasoning effort/i);
@@ -173,7 +173,7 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(agent, /gpt-5-4-prompting/);
   assert.match(agent, /only to tighten the user's request into a better Codex prompt/i);
   assert.match(agent, /Do not use that skill to inspect the repository, reason through the problem yourself, draft a solution, or do any independent work/i);
-  assert.match(runtimeSkill, /only job is to invoke `task` once and return that stdout unchanged/i);
+  assert.match(runtimeSkill, /only job is to invoke `prompt-path`.*invoke `task` once, and return that stdout unchanged/i);
   assert.match(runtimeSkill, /Do not call `setup`, `review`, `adversarial-review`, `status`, `result`, or `cancel`/i);
   assert.match(runtimeSkill, /use the `gpt-5-4-prompting` skill to rewrite the user's request into a tighter Codex prompt/i);
   assert.match(runtimeSkill, /That prompt drafting is the only Claude-side work allowed/i);
@@ -200,6 +200,31 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(readme, /### `\/codex:status`/);
   assert.match(readme, /### `\/codex:result`/);
   assert.match(readme, /### `\/codex:cancel`/);
+});
+
+test("rescue prompt delivery goes through prompt-path and Write, never inline in a Bash command", () => {
+  const rescue = read("commands/rescue.md");
+  const agent = read("agents/codex-rescue.md");
+  const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
+
+  // #57 of 186 tracked rescue runs failed from the prompt riding inline in the
+  // `task` Bash command string (unexpected EOF, the 6000-char command-length
+  // gate, a trailing backslash eating a quote). The main-thread session that
+  // instead writes a file via --prompt-file had 0 failures in 22 runs. The
+  // fix is structural: the agent must declare Write and route every prompt
+  // through a file it never inlines.
+  assert.match(agent, /^tools:\s*Bash,\s*Write\s*$/m);
+  assert.match(rescue, /allowed-tools:\s*Bash\(node:\*\),\s*AskUserQuestion,\s*Agent,\s*Write/);
+  assert.match(agent, /prompt text NEVER goes inline in a Bash command string/i);
+  assert.match(agent, /prompt-path --cwd <dir> --label rescue/);
+  assert.match(agent, /use `Write` to save the shaped task text to exactly that path/i);
+  assert.match(agent, /If the caller already forwarded `--prompt-file <path>`, forward that flag to `task` as-is/i);
+  assert.match(rescue, /prompt-path --cwd <dir> --label rescue/);
+  assert.match(rescue, /`Write` the shaped text to that exact path/i);
+  assert.match(rescue, /prompt text itself never appears as literal text inside a `task` Bash command/i);
+  assert.match(runtimeSkill, /prompt-path --cwd <dir> --label rescue/);
+  assert.match(runtimeSkill, /prompt text never goes inline in the `task` command string/i);
+  assert.match(runtimeSkill, /task --prompt-file "<path>"/);
 });
 
 test("transfer, result, and cancel commands are exposed as deterministic runtime entrypoints", () => {
@@ -238,7 +263,7 @@ test("internal docs use task terminology for rescue runs", () => {
   const promptingSkill = read("skills/gpt-5-4-prompting/SKILL.md");
   const promptRecipes = read("skills/gpt-5-4-prompting/references/codex-prompt-recipes.md");
 
-  assert.match(runtimeSkill, /codex-companion\.mjs" task "<raw arguments>"/);
+  assert.match(runtimeSkill, /codex-companion\.mjs" task --prompt-file "<path>"/);
   assert.match(runtimeSkill, /Use `task` for every rescue request/i);
   assert.match(runtimeSkill, /task --resume-last/i);
   assert.match(promptingSkill, /Use `task` when the task is diagnosis/i);

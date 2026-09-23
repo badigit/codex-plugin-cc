@@ -1,7 +1,7 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue subagent
 argument-hint: "[--background|--wait] [--read-only] [--cwd <dir>|-C <dir>] [--resume|--fresh] [--model <model|spark|sol|terra|luna>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [what Codex should investigate, solve, or continue]"
-allowed-tools: Bash(node:*), AskUserQuestion, Agent
+allowed-tools: Bash(node:*), AskUserQuestion, Agent, Write
 ---
 
 Invoke the `codex:codex-rescue` subagent via the `Agent` tool (`subagent_type: "codex:codex-rescue"`), forwarding the raw user request as the prompt.
@@ -21,6 +21,12 @@ Example: a request about "issue #144" with `--model sol --effort xhigh` → desc
 
 Raw user request:
 $ARGUMENTS
+
+Prompt delivery for long requests:
+
+- For a long or multi-paragraph request (pasted logs, a multi-step spec, anything that would strain a shell command line), this command MAY shape the task text itself, run `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" prompt-path --cwd <dir> --label rescue` to get a fresh path, `Write` the shaped text to that exact path, and pass `--prompt-file "<path>"` as part of the request forwarded to the `codex:codex-rescue` subagent. This is preferred over letting the subagent redo the same two steps for a request that is already this long.
+- For a short request, forwarding the raw text is fine — the subagent performs the same `prompt-path` + `Write` dance itself before calling `task`.
+- Either way, the prompt text itself never appears as literal text inside a `task` Bash command — see Operating rules below.
 
 Execution mode:
 
@@ -56,7 +62,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task-resume-candidate -
 
 Operating rules:
 
-- The subagent is a thin forwarder only. It should use one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task ...` and return that command's stdout as-is.
+- The subagent is a thin forwarder only. The prompt text never goes inline in a `task` Bash command string: unless a `--prompt-file <path>` was already forwarded, the subagent gets the path from one `prompt-path` `Bash` call, `Write`s the task text there, then makes one `task` `Bash` call with `--prompt-file "<path>"` and returns that command's stdout as-is.
 - Pass `--cwd <dir>` explicitly for the intended workspace root. Add `--background` to the `task` invocation unless the caller explicitly chose `--wait`, so a caller Bash-tool timeout cannot terminate the run or force an auto-background.
 - Always pass `--label rescue`, so the run is identifiable as a rescue in the Codex app's session list instead of blending into every other delegated task.
 - Terminal-on-timeout: if the single `task` Bash call returns because the host auto-backgrounded it at the Bash-tool timeout, the subagent MUST make no second Bash call (no `status`, `result`, `cat`, `sleep`, or `until grep`). The Codex turn keeps running and is recovered later by the caller via `/codex:status` / `/codex:result`.

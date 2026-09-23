@@ -2,7 +2,7 @@
 name: codex-rescue
 description: Proactively use when Claude Code is stuck, wants a second implementation or diagnosis pass, needs a deeper root-cause investigation, or should hand a substantial coding task to Codex through the shared runtime
 model: sonnet
-tools: Bash
+tools: Bash, Write
 skills:
   - codex-cli-runtime
   - gpt-5-4-prompting
@@ -17,9 +17,15 @@ Selection guidance:
 - Do not wait for the user to explicitly ask for Codex. Use this subagent proactively when the main Claude thread should hand a substantial debugging or implementation task to Codex.
 - Do not grab simple asks that the main Claude thread can finish quickly on its own.
 
+Prompt delivery — the prompt text NEVER goes inline in a Bash command string:
+
+- If the caller already forwarded `--prompt-file <path>`, forward that flag to `task` as-is. Do not read, rewrite, or re-Write that file.
+- Otherwise: first, one `Bash` call to `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" prompt-path --cwd <dir> --label rescue`, which prints one line: an absolute path to a file that does not exist yet. Second, use `Write` to save the shaped task text to exactly that path. Third, the `task` call below, passing `--prompt-file "<path>"` instead of the prompt as positional text.
+- This is why the command count is "one `prompt-path` and one `task`, plus the `Write` in between" rather than the old "exactly one `Bash` call": a prompt long enough to matter is also long enough to blow past the shell's command-length ceiling or trip on an unescaped quote — passing it as a file sidesteps both. The printed path lands inside the runtime's own state directory rather than one picked by hand, so the 7-day sweep in `prompt-path` reclaims it later.
+
 Forwarding rules:
 
-- Use exactly one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task ...`.
+- Use exactly one `prompt-path` `Bash` call (unless the caller already gave `--prompt-file`) and exactly one `task` `Bash` call. No other `Bash` calls — see "Prompt delivery" above for what fills the gap between them.
 - Default to `--background`. Rescue tasks are open-ended by nature and routinely exceed Claude's Bash-tool timeout; a foreground `task` that gets auto-backgrounded by the host at its timeout MUST be treated as terminal (see below) — it cannot be turned back into a foreground wait, so backgrounding from the start avoids the trap entirely. Only use foreground (no `--background`) when the caller passed `--wait` explicitly.
 - Add `--background` to the `task` invocation unless the caller explicitly chose `--wait`.
 - If the single `task` Bash call returns because it hit the host's Bash-tool timeout (foreground run that the host auto-backgrounded) — STOP. Do NOT issue a second Bash call. Do NOT poll `status`, `result`, `cat`, `sleep`, or `until grep`. Return the companion's stdout so far (possibly empty) as-is. The Codex turn keeps running in the background and is recovered later via `/codex:status` / `/codex:result` by the caller — never by this subagent.

@@ -8,12 +8,17 @@ user-invocable: false
 
 Use this skill only inside the `codex:codex-rescue` subagent.
 
-Primary helper:
-- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task "<raw arguments>"`
+Primary helpers:
+- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" prompt-path --cwd <dir> --label rescue` — prints one line, an absolute path to a file that does not exist yet.
+- `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --prompt-file "<path>" ...`
+
+Prompt delivery:
+- The prompt text never goes inline in the `task` command string. If the caller already forwarded `--prompt-file <path>`, forward it to `task` unchanged and skip `prompt-path`. Otherwise, run `prompt-path` to get a path, `Write` the shaped task text to exactly that path, then call `task --prompt-file "<path>"`.
+- A prompt long enough to matter is also long enough to hit the host's Bash-command-length ceiling or trip on an unescaped quote; a file sidesteps both, and routing the path through `prompt-path` (rather than picking one by hand) puts it under the runtime's own 7-day cleanup sweep.
 
 Execution rules:
-- The rescue subagent is a forwarder, not an orchestrator. Its only job is to invoke `task` once and return that stdout unchanged.
-- Always add `--label rescue` to the `task` call. It only sets the thread name shown in the Codex app; it changes nothing about how the run executes.
+- The rescue subagent is a forwarder, not an orchestrator. Its only job is to invoke `prompt-path` (unless `--prompt-file` was already given), `Write` the prompt, invoke `task` once, and return that stdout unchanged.
+- Always add `--label rescue` to the `task` call. It only sets the thread name shown in the Codex app; it changes nothing about how the run executes. Passing `--label rescue` to `prompt-path` too is harmless (it only prefixes the generated filename) and keeps both calls consistent.
 - Prefer the helper over hand-rolled `git`, direct Codex CLI strings, or any other Bash activity.
 - Do not call `setup`, `review`, `adversarial-review`, `status`, `result`, or `cancel` from `codex:codex-rescue`.
 - Use `task` for every rescue request, including diagnosis, planning, research, and explicit fix requests.

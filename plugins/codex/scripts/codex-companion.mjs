@@ -28,6 +28,7 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  resolveStateDir,
   setConfig,
   upsertJob,
   writeJobFile
@@ -139,7 +140,8 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|terra|luna>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|terra|luna>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--read-only] [--cwd <dir>] [--resume-last|--resume|--fresh] [--label <task|review|rescue>] [--model <model|spark|sol|terra|luna>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--read-only] [--cwd <dir>] [--prompt-file <path>] [--resume-last|--resume|--fresh] [--label <task|review|rescue>] [--model <model|spark|sol|terra|luna>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [prompt]",
+      "  node scripts/codex-companion.mjs prompt-path [--cwd <dir>] [--label <name>] [--json]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -1138,6 +1140,85 @@ function handleResult(argv) {
   outputCommandResult(payload, renderStoredJobResult(job, storedJob), options.json);
 }
 
+// Prompt files older than this are swept on every `prompt-path` call. The
+// runtime never deletes a prompt file it wrote (the caller owns cleanup of
+// what it just read), so without this sweep the directory grows one file per
+// rescue run forever.
+const PROMPT_FILE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+function resolvePromptsDir(cwd) {
+  return path.join(resolveStateDir(cwd), "prompts");
+}
+
+// Mirrors the workspace-slug sanitizer in lib/state.mjs: keep the label
+// filesystem-safe and fall back to a fixed word rather than reject a caller's
+// free-text label outright.
+function sanitizePromptLabel(label) {
+  const trimmed = String(label ?? "").trim();
+  const slug = trimmed.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  return slug || "task";
+}
+
+function pruneOldPromptFiles(promptsDir, now = Date.now()) {
+  let entries;
+  try {
+    entries = fs.readdirSync(promptsDir, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return;
+    }
+    throw error;
+  }
+
+  for (const entry of entries) {
+    if (!entry.isFile()) {
+      continue;
+    }
+    const filePath = path.join(promptsDir, entry.name);
+    let stats;
+    try {
+      stats = fs.statSync(filePath);
+    } catch {
+      continue;
+    }
+    if (now - stats.mtimeMs > PROMPT_FILE_MAX_AGE_MS) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch {
+        // Best-effort: a file removed or locked between readdir and unlink
+        // is not this command's problem to report.
+      }
+    }
+  }
+}
+
+// Prints the path a caller should Write its prompt text to, then pass back as
+// `task --prompt-file <path>`. Deliberately does NOT create the file: Claude
+// Code's Write tool refuses to overwrite a path it has not read, so handing
+// back an already-existing (even empty) file would make the very next step
+// fail.
+function generatePromptFilePath(cwd, label) {
+  const promptsDir = resolvePromptsDir(cwd);
+  fs.mkdirSync(promptsDir, { recursive: true });
+  pruneOldPromptFiles(promptsDir);
+
+  const slug = sanitizePromptLabel(label);
+  const timestamp = Date.now().toString(36);
+  const random = Math.random().toString(36).slice(2, 8);
+  return path.join(promptsDir, `${slug}-${timestamp}-${random}.md`);
+}
+
+function handlePromptPath(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "label"],
+    booleanOptions: ["json"]
+  });
+
+  const cwd = resolveTaskCwd(options);
+  const filePath = generatePromptFilePath(cwd, options.label);
+  outputCommandResult({ path: filePath }, `${filePath}\n`, options.json);
+}
+
 function handleTaskResumeCandidate(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
@@ -1326,6 +1407,9 @@ async function main() {
       break;
     case "task":
       await handleTask(argv);
+      break;
+    case "prompt-path":
+      handlePromptPath(argv);
       break;
     case "transfer":
       await handleTransfer(argv);
