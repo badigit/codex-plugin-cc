@@ -12,7 +12,7 @@ import {
   resolveCancelableJob,
   settleCancellationAfterTermination
 } from "../plugins/codex/scripts/lib/job-control.mjs";
-import { resolveStateDir, upsertJob, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
+import { resolveScratchSandboxDir, resolveStateDir, upsertJob, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
 import { runTrackedJob } from "../plugins/codex/scripts/lib/tracked-jobs.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -1664,6 +1664,166 @@ test("task rejects --write with --read-only", () => {
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /Choose either --write or --read-only\./);
+});
+
+test("task rejects --scratch-sandbox with --write", () => {
+  const result = run("node", [SCRIPT, "task", "--write", "--scratch-sandbox", "run the tests"], {
+    cwd: ROOT
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Choose either --write or --scratch-sandbox/);
+});
+
+test("task --scratch-sandbox with --background rejects --write before queuing a job", () => {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--write", "--scratch-sandbox", "--background", "run the tests"], {
+    cwd: repo
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Choose either --write or --scratch-sandbox/);
+  const stateDir = resolveStateDir(repo);
+  assert.equal(fs.existsSync(path.join(stateDir, "state.json")), false, "no job should have been queued");
+});
+
+test("task --scratch-sandbox points the app-server thread at a scratch directory, not the repository", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--scratch-sandbox", "run the tests"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  const scratchDir = resolveScratchSandboxDir(repo);
+
+  assert.equal(fakeState.lastThreadStart.sandbox, "workspace-write");
+  assert.equal(fakeState.lastThreadStart.cwd, scratchDir);
+  assert.notEqual(fakeState.lastThreadStart.cwd, repo);
+  assert.deepEqual(fakeState.lastThreadStart.config?.sandbox_workspace_write, { writable_roots: [scratchDir] });
+  assert.deepEqual(fakeState.lastThreadStart.config?.shell_environment_policy, {
+    set: { TEMP: scratchDir, TMP: scratchDir }
+  });
+
+  // The prompt must tell Codex where the (read-only) repository actually is.
+  // Path separators are compared loosely: companion normalizes cwd/workspace
+  // paths to forward slashes internally (via git), while `repo` here is
+  // whatever raw form os.tmpdir()/mkdtemp returned (backslashes on Windows).
+  const repoForwardSlash = repo.replace(/\\/g, "/");
+  assert.match(fakeState.lastTurnStart.prompt, /scratch sandbox/i);
+  assert.match(fakeState.lastTurnStart.prompt, new RegExp(repoForwardSlash.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(fakeState.lastTurnStart.prompt, /run the tests/);
+
+  // Job bookkeeping (status/result lookup) stays keyed by the REPOSITORY, not
+  // the scratch directory: this is what lets `status`/`result --cwd <repo>`
+  // find the job afterwards.
+  const persistedJob = readPersistedJob(repo);
+  assert.equal(persistedJob.workspaceRoot.replace(/\\/g, "/"), repoForwardSlash);
+
+  const statusResult = run("node", [SCRIPT, "status", persistedJob.id, "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(statusResult.status, 0, statusResult.stderr);
+  const statusPayload = JSON.parse(statusResult.stdout);
+  assert.equal(statusPayload.job.id, persistedJob.id);
+  assert.equal(statusPayload.job.status, "completed");
+});
+
+test("task --scratch-sandbox clears leftovers from a previous run before starting", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const scratchDir = resolveScratchSandboxDir(repo);
+  fs.mkdirSync(scratchDir, { recursive: true });
+  const leftoverPath = path.join(scratchDir, "leftover-from-previous-run.txt");
+  fs.writeFileSync(leftoverPath, "stale\n");
+
+  const result = run("node", [SCRIPT, "task", "--scratch-sandbox", "run the tests"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(leftoverPath), false, "scratch directory contents must be cleared before the run");
+  assert.equal(fs.existsSync(scratchDir), true, "the scratch directory itself must survive (stable path for its sandbox grant)");
+});
+
+test("task --read-only behavior is unchanged without --scratch-sandbox (no scratch dir, cwd is the repository)", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "task", "--read-only", "inspect the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.equal(fakeState.lastThreadStart.sandbox, "read-only");
+  assert.equal(fakeState.lastThreadStart.cwd.replace(/\\/g, "/"), repo.replace(/\\/g, "/"));
+  assert.equal(fakeState.lastThreadStart.config, null);
+  assert.doesNotMatch(fakeState.lastTurnStart.prompt, /scratch sandbox/i);
+  assert.equal(fs.existsSync(resolveScratchSandboxDir(repo)), false, "no scratch dir should be created without --scratch-sandbox");
+});
+
+test("task --scratch-sandbox --background finds its job by repository via status/result", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const launch = run(
+    "node",
+    [SCRIPT, "task", "--background", "--scratch-sandbox", "--json", "run the tests"],
+    {
+      cwd: repo,
+      env: buildEnv(binDir)
+    }
+  );
+  assert.equal(launch.status, 0, launch.stderr);
+  const launchPayload = JSON.parse(launch.stdout);
+
+  const waited = await waitFor(() => {
+    const status = run("node", [SCRIPT, "status", launchPayload.jobId, "--json"], {
+      cwd: repo,
+      env: buildEnv(binDir)
+    });
+    if (status.status !== 0) {
+      return null;
+    }
+    const payload = JSON.parse(status.stdout);
+    return payload.job.status === "completed" ? payload : null;
+  }, { timeoutMs: 15000 });
+  assert.equal(waited.job.id, launchPayload.jobId);
+
+  const result = run("node", [SCRIPT, "result", launchPayload.jobId, "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const resultPayload = JSON.parse(result.stdout);
+  assert.equal(resultPayload.job.id, launchPayload.jobId);
+  assert.equal(resultPayload.job.status, "completed");
 });
 
 test("review accepts (ignores) positional focus text for parity with adversarial-review", () => {

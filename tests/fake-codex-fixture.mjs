@@ -385,7 +385,8 @@ rl.on("line", (line) => {
 	          model: selectedModel,
 	          effort: selectedEffort,
 	          config: message.params.config ?? null,
-	          sandbox: message.params.sandbox ?? null
+	          sandbox: message.params.sandbox ?? null,
+	          cwd: message.params.cwd ?? null
 	        };
 	        saveState(state);
 	        send({ id: message.id, result: { thread: buildThread(thread), model: selectedModel, modelProvider, serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: selectedEffort } });
