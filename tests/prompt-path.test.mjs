@@ -338,3 +338,105 @@ test("task still accepts a prompt piped over stdin (no --prompt-file involved)",
   const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
   assert.match(fakeState.lastTurnStart.prompt, /investigate the piped stdin prompt path/);
 });
+
+// Review round 2 (78f99d2 -> this commit): deletion used to happen inside
+// readTaskPrompt, before ANY precondition check — a flag conflict, a missing
+// Codex install, or (as here) --resume-last finding no prior thread would
+// still burn the one-shot prompt file even though the task was never
+// accepted. Deletion now happens only once handleTask reaches the point
+// where the job is durably queued (background) or the foreground run
+// actually executed past every precondition (see the comments next to both
+// consumeOneShotPromptFile call sites in handleTask).
+test("task --prompt-file --resume-last errors when no prior thread exists, and leaves the prompt file in place", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = buildEnv(binDir);
+  const pathResult = promptPath(["--cwd", repo, "--label", "rescue"], { cwd: repo, env });
+  const promptFile = pathResult.stdout.trim();
+  fs.writeFileSync(promptFile, "Resume the previous rescue run.\n", "utf8");
+
+  const result = run("node", [SCRIPT, "task", "--prompt-file", promptFile, "--resume-last"], {
+    cwd: repo,
+    env
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /No previous Codex task thread was found for this repository\./);
+  assert.equal(fs.existsSync(promptFile), true);
+});
+
+test("task --prompt-file leaves an in-prompts-dir file alone when its name doesn't match prompt-path's naming pattern", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = buildEnv(binDir);
+  const promptsDir = path.join(resolveStateDir(repo), "prompts");
+  fs.mkdirSync(promptsDir, { recursive: true });
+  // Same directory a real prompt-path file would live in, but a name
+  // prompt-path never generates (no uuid suffix) — e.g. something a human
+  // dropped in there directly.
+  const foreignNamedFile = path.join(promptsDir, "notes.md");
+  fs.writeFileSync(foreignNamedFile, "Not something prompt-path generated.\n", "utf8");
+
+  const result = run("node", [SCRIPT, "task", "--prompt-file", foreignNamedFile], {
+    cwd: repo,
+    env
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(foreignNamedFile), true);
+});
+
+test(
+  "task --prompt-file refuses to delete through a symlink, even one named like a prompt-path file",
+  (t) => {
+    const repo = makeTempDir();
+    const binDir = makeTempDir();
+    installFakeCodex(binDir);
+    initGitRepo(repo);
+    fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+    run("git", ["add", "README.md"], { cwd: repo });
+    run("git", ["commit", "-m", "init"], { cwd: repo });
+
+    const env = buildEnv(binDir);
+    const promptsDir = path.join(resolveStateDir(repo), "prompts");
+    fs.mkdirSync(promptsDir, { recursive: true });
+
+    const outsideDir = makeTempDir();
+    const outsideTarget = path.join(outsideDir, "outside-target.md");
+    fs.writeFileSync(outsideTarget, "Should never be deleted through the symlink.\n", "utf8");
+
+    // A name that DOES match PROMPT_FILE_NAME_PATTERN, so this isolates the
+    // symlink check from the name-pattern check above.
+    const symlinkPath = path.join(promptsDir, `rescue-${crypto.randomUUID()}.md`);
+    try {
+      fs.symlinkSync(outsideTarget, symlinkPath, "file");
+    } catch (error) {
+      // Creating a symlink needs elevated privileges or Developer Mode on
+      // Windows without them (same environment gap worktree.test.mjs's
+      // symlink tests hit) — skip rather than fail on an unrelated cause.
+      t.skip(`cannot create filesystem symlinks in this environment: ${error.message}`);
+      return;
+    }
+
+    const result = run("node", [SCRIPT, "task", "--prompt-file", symlinkPath], {
+      cwd: repo,
+      env
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.existsSync(symlinkPath), true);
+    assert.equal(fs.existsSync(outsideTarget), true);
+  }
+);

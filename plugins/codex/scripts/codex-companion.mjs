@@ -811,21 +811,22 @@ function resolveTurnHardCeilingMsFromOptions(options) {
   return options.background ? DEFAULT_TURN_HARD_CEILING_MS : FOREGROUND_TURN_TIMEOUT_MS;
 }
 
+// Reads the prompt but does NOT delete a one-shot `--prompt-file`: deletion
+// only happens once the task this prompt is for has actually been accepted —
+// see the `consumeOneShotPromptFile` calls in handleTask below, and the
+// comment there for why deletion cannot live here. The read itself does
+// still happen exactly once, before `task` branches into foreground vs
+// `--background`: the text (not the path) is what ends up in the job
+// request, so a detached worker never re-reads this file regardless of which
+// branch runs next.
 function readTaskPrompt(cwd, options, positionals) {
   if (options["prompt-file"]) {
     const promptFilePath = path.resolve(cwd, options["prompt-file"]);
-    const prompt = fs.readFileSync(promptFilePath, "utf8");
-    // Read happens once, here, before `task` branches into foreground vs
-    // `--background` — the text itself (not the path) is what ends up in the
-    // job request, so a detached worker never re-reads this file. Consuming
-    // it now, in the same call, keeps deletion tied to the single read
-    // regardless of which branch runs next.
-    consumeOneShotPromptFile(cwd, promptFilePath);
-    return prompt;
+    return { prompt: fs.readFileSync(promptFilePath, "utf8"), promptFilePath };
   }
 
   const positionalPrompt = positionals.join(" ");
-  return positionalPrompt || readStdinIfPiped();
+  return { prompt: positionalPrompt || readStdinIfPiped(), promptFilePath: null };
 }
 
 function requireTaskRequest(prompt, resumeLast) {
@@ -976,7 +977,7 @@ async function handleTask(argv) {
   const model = normalizeRequestedModel(options.model);
   const effort = normalizeReasoningEffort(options.effort);
   announceRun(model, effort);
-  const prompt = readTaskPrompt(cwd, options, positionals);
+  const { prompt, promptFilePath } = readTaskPrompt(cwd, options, positionals);
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
   const fresh = Boolean(options.fresh);
@@ -1015,6 +1016,15 @@ async function handleTask(argv) {
       hardCeilingMs: resolveTurnHardCeilingMsFromOptions(options)
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
+    // Only past this point is the task actually accepted: the job is
+    // durably queued and a detached worker has been spawned to run it. Every
+    // check above (flag conflicts, Codex availability, an empty prompt with
+    // no --resume-last) can still throw, and a thrown error skips this line
+    // entirely — leaving a one-shot prompt file in place is exactly what we
+    // want when the task was never accepted.
+    if (promptFilePath) {
+      consumeOneShotPromptFile(cwd, promptFilePath);
+    }
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
@@ -1039,6 +1049,16 @@ async function handleTask(argv) {
       }),
     { json: options.json }
   );
+  // executeTaskRun's own preconditions — Codex availability, resolving
+  // --resume-last to an actual thread, "provide a prompt" — throw inside the
+  // runner. runTrackedJob catches that, marks the job failed, and rethrows;
+  // runForegroundCommand does not swallow it, so the `await` above rejects
+  // and this line is never reached. Only a run that genuinely executed
+  // (successfully or with a Codex-side failure reflected in exitStatus, not
+  // a thrown precondition error) reaches here and consumes the prompt file.
+  if (promptFilePath) {
+    consumeOneShotPromptFile(cwd, promptFilePath);
+  }
 }
 
 async function handleTransfer(argv) {
@@ -1181,19 +1201,23 @@ function sanitizePromptLabel(label) {
 // POSIX: owner-only (0o700). A prompt file can carry whatever the caller
 // pasted into a rescue request — paths, log excerpts, snippets that might
 // include client data — so the directory holding it should not be
-// world/group-readable. On Windows, ACL inheritance from the parent plugin
-// data directory is left as-is: `consumeOneShotPromptFile` below cuts the
-// file's on-disk lifetime to seconds (deleted right after `task` reads it),
-// which stands in for directory-level isolation there instead.
+// world/group-readable. Fail-closed: if we cannot narrow it, throw rather
+// than silently keep serving prompt files from a directory whose real
+// permissions we don't know. On Windows, ACL inheritance from the parent
+// plugin data directory is left as-is (chmod's owner/group/other bits do not
+// map onto Windows ACLs) — `consumeOneShotPromptFile` below cuts the file's
+// on-disk lifetime to seconds (deleted right after `task` reads it), which
+// stands in for directory-level isolation there instead.
 function ensurePromptsDir(promptsDir) {
   fs.mkdirSync(promptsDir, { recursive: true, mode: 0o700 });
-  if (process.platform !== "win32") {
-    try {
-      fs.chmodSync(promptsDir, 0o700);
-    } catch {
-      // Best-effort narrowing. The directory still exists and is usable even
-      // if this particular chmod lost a race or hit a read-only mount.
-    }
+  if (process.platform === "win32") {
+    return;
+  }
+  try {
+    fs.chmodSync(promptsDir, 0o700);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Could not restrict prompts directory ${promptsDir} to owner-only (0700): ${detail}`);
   }
 }
 
@@ -1256,24 +1280,59 @@ function handlePromptPath(argv) {
   outputCommandResult({ path: filePath }, `${filePath}\n`, options.json);
 }
 
+// Whether `promptFilePath` is a file this runtime itself handed out via
+// `prompt-path` — and is therefore ours to delete. Three independent checks,
+// all required, because each guards against a different way a path could
+// look "close enough" without actually being our file:
+//   - name pattern: only `<label>-<uuid>.md` is a shape `prompt-path` would
+//     have generated. Guards a caller's own file dropped into the same
+//     directory under a name we did not choose.
+//   - realpath containment: resolve BOTH the file and the prompts directory
+//     through the filesystem (not string prefix matching) and require the
+//     file's real parent to equal the real prompts directory exactly — one
+//     level, not a subdirectory, and not reachable only via a symlinked
+//     ancestor that makes a lexical prefix match lie.
+//   - lstat on the ORIGINAL (unresolved) path: if the path itself is a
+//     symlink, refuse it. Deleting through a symlink whose target we did not
+//     verify could delete something outside the prompts directory entirely.
+function isOwnedPromptFile(cwd, promptFilePath) {
+  if (!PROMPT_FILE_NAME_PATTERN.test(path.basename(promptFilePath))) {
+    return false;
+  }
+
+  const promptsDir = resolvePromptsDir(cwd);
+  let entryStats;
+  let realPromptsDir;
+  let realFilePath;
+  try {
+    entryStats = fs.lstatSync(promptFilePath);
+    realPromptsDir = fs.realpathSync(promptsDir);
+    realFilePath = fs.realpathSync(promptFilePath);
+  } catch {
+    // Missing, unreadable, or the prompts directory does not exist (nothing
+    // was ever handed out for this workspace) — not ours to touch.
+    return false;
+  }
+
+  if (entryStats.isSymbolicLink() || !entryStats.isFile()) {
+    return false;
+  }
+
+  return path.dirname(realFilePath) === realPromptsDir;
+}
+
 // A prompt file handed out by `prompt-path` is single-use: once `task` has
 // read it, nothing else ever will. Deleting it immediately — rather than
 // waiting for the next `prompt-path` call's age sweep, which could be days
 // away — bounds how long a prompt that may carry client data sits on disk.
-// Only files inside our own prompts directory are removed; a caller's own
-// file passed via `--prompt-file` from somewhere else is never touched.
+// Only files this runtime actually owns (see isOwnedPromptFile) are removed;
+// a caller's own file passed via `--prompt-file` from somewhere else, or a
+// same-directory file we did not generate, is never touched.
 // Also re-runs the age sweep here (not just from `prompt-path`), so a
 // directory that only ever sees `task` calls — never a fresh `prompt-path`
 // in between — still gets swept.
 function consumeOneShotPromptFile(cwd, promptFilePath) {
-  const promptsDir = resolvePromptsDir(cwd);
-  const relative = path.relative(promptsDir, promptFilePath);
-  const isInsidePromptsDir =
-    relative !== "" &&
-    relative !== ".." &&
-    !relative.startsWith(`..${path.sep}`) &&
-    !path.isAbsolute(relative);
-  if (isInsidePromptsDir) {
+  if (isOwnedPromptFile(cwd, promptFilePath)) {
     try {
       fs.unlinkSync(promptFilePath);
     } catch {
@@ -1281,7 +1340,7 @@ function consumeOneShotPromptFile(cwd, promptFilePath) {
       // sweep below (and the next prompt-path call) is the backstop.
     }
   }
-  pruneOldPromptFiles(promptsDir);
+  pruneOldPromptFiles(resolvePromptsDir(cwd));
 }
 
 function handleTaskResumeCandidate(argv) {
