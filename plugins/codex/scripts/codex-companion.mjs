@@ -141,7 +141,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|terra|luna>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|terra|luna>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--read-only] [--cwd <dir>] [--prompt-file <path>] [--resume-last|--resume|--fresh] [--label <task|review|rescue>] [--model <model|spark|sol|terra|luna>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--read-only] [--cwd <dir>] [--prompt-file <path>] [--output-schema <path>] [--resume-last|--resume|--fresh] [--label <task|review|rescue>] [--model <model|spark|sol|terra|luna>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [prompt]",
       "  node scripts/codex-companion.mjs prompt-path [--cwd <dir>] [--label <name>] [--json]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
@@ -599,6 +599,7 @@ async function executeTaskRun(request) {
     model: request.model,
     effort: request.effort,
     sandbox: request.write ? "workspace-write" : request.readOnly ? "read-only" : null,
+    outputSchema: request.outputSchema ?? null,
     onProgress: request.onProgress,
     persistThread: true,
     turnTimeoutMs: request.turnTimeoutMs,
@@ -627,6 +628,16 @@ async function executeTaskRun(request) {
     touchedFiles: result.touchedFiles,
     reasoningSummary: result.reasoningSummary
   };
+  // Only attempted when the caller actually asked for structured output —
+  // reusing the same parser adversarial-review's turn/start already uses
+  // (parseStructuredOutput), rather than a second ad-hoc JSON.parse. Without
+  // --output-schema the payload gains no new keys, so plain `task` runs stay
+  // byte-for-byte unchanged.
+  if (request.outputSchema) {
+    const structuredResult = parseStructuredOutput(rawOutput, { failureMessage: failureMessage || null });
+    payload.structured = structuredResult.parsed;
+    payload.structuredError = structuredResult.parseError;
+  }
 
   return {
     exitStatus: result.status,
@@ -730,7 +741,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, readOnly, resumeLast, label, jobId, turnTimeoutMs, hardCeilingMs }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, readOnly, resumeLast, label, jobId, turnTimeoutMs, hardCeilingMs, outputSchema }) {
   return {
     cwd,
     model,
@@ -742,7 +753,8 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, readOnly, resumeL
     label,
     jobId,
     turnTimeoutMs,
-    hardCeilingMs
+    hardCeilingMs,
+    outputSchema: outputSchema ?? null
   };
 }
 
@@ -827,6 +839,28 @@ function readTaskPrompt(cwd, options, positionals) {
 
   const positionalPrompt = positionals.join(" ");
   return { prompt: positionalPrompt || readStdinIfPiped(), promptFilePath: null };
+}
+
+// Reads and parses `--output-schema` exactly once, up front — same shape as
+// readTaskPrompt above: the parsed schema object (not the path) is what ends
+// up in the job request, so a detached background worker never re-reads this
+// file. A missing or malformed schema throws BEFORE the job is created (or,
+// in the foreground, before Codex is even asked to run), so a bad path never
+// costs the caller a queued job or a spent turn — and, per the same
+// precondition-vs-acceptance split readTaskPrompt's comment documents, this
+// runs before any `--prompt-file` is consumed, so a rejected schema leaves
+// the one-shot prompt file in place for a retry.
+function readTaskOutputSchema(cwd, options) {
+  if (!options["output-schema"]) {
+    return null;
+  }
+  const schemaPath = path.resolve(cwd, options["output-schema"]);
+  try {
+    return readOutputSchema(schemaPath);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Could not read --output-schema ${schemaPath}: ${detail}`);
+  }
 }
 
 function requireTaskRequest(prompt, resumeLast) {
@@ -965,7 +999,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file", "turn-timeout-ms", "label"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "output-schema", "turn-timeout-ms", "label"],
     booleanOptions: ["json", "write", "read-only", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
@@ -978,6 +1012,10 @@ async function handleTask(argv) {
   const effort = normalizeReasoningEffort(options.effort);
   announceRun(model, effort);
   const { prompt, promptFilePath } = readTaskPrompt(cwd, options, positionals);
+  // Read and parse up front, same as the prompt file: a bad --output-schema
+  // must fail BEFORE a background job is queued or a foreground turn is
+  // spent, and before promptFilePath is ever consumed below.
+  const outputSchema = readTaskOutputSchema(cwd, options);
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
   const fresh = Boolean(options.fresh);
@@ -1013,7 +1051,8 @@ async function handleTask(argv) {
       label,
       jobId: job.id,
       turnTimeoutMs: resolveTurnTimeoutMsFromOptions(options),
-      hardCeilingMs: resolveTurnHardCeilingMsFromOptions(options)
+      hardCeilingMs: resolveTurnHardCeilingMsFromOptions(options),
+      outputSchema
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
     // Only past this point is the task actually accepted: the job is
@@ -1045,6 +1084,7 @@ async function handleTask(argv) {
         jobId: job.id,
         turnTimeoutMs: resolveTurnTimeoutMsFromOptions(options),
         hardCeilingMs: resolveTurnHardCeilingMsFromOptions(options),
+        outputSchema,
         onProgress: progress
       }),
     { json: options.json }

@@ -620,7 +620,8 @@ rl.on("line", (line) => {
 	          turnId,
 	          model: message.params.model ?? null,
 	          effort: message.params.effort ?? null,
-	          prompt
+	          prompt,
+	          outputSchema: message.params.outputSchema ?? null
 	        };
 	        saveState(state);
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
