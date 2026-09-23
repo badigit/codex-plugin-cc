@@ -1023,7 +1023,7 @@ async function handleTask(argv) {
     // entirely — leaving a one-shot prompt file in place is exactly what we
     // want when the task was never accepted.
     if (promptFilePath) {
-      consumeOneShotPromptFile(cwd, promptFilePath);
+      safelyConsumeOneShotPromptFile(cwd, promptFilePath);
     }
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
@@ -1057,7 +1057,7 @@ async function handleTask(argv) {
   // (successfully or with a Codex-side failure reflected in exitStatus, not
   // a thrown precondition error) reaches here and consumes the prompt file.
   if (promptFilePath) {
-    consumeOneShotPromptFile(cwd, promptFilePath);
+    safelyConsumeOneShotPromptFile(cwd, promptFilePath);
   }
 }
 
@@ -1179,14 +1179,96 @@ function handleResult(argv) {
 const PROMPT_FILE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 // Matches exactly the names `generatePromptFilePath` produces:
-// `<sanitized-label>-<uuidv4>.md`. The age sweep only ever deletes files
-// matching this, so a caller's own unrelated file dropped into the same
-// directory is never touched even after it goes stale.
+// `<sanitized-label>-<uuidv4>.md`. The age sweep and the one-shot delete
+// only ever touch files matching this, so a caller's own unrelated file
+// dropped into the same directory is never removed, stale or not.
 const PROMPT_FILE_NAME_PATTERN =
   /^[a-zA-Z0-9._-]+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.md$/;
 
 function resolvePromptsDir(cwd) {
   return path.join(resolveStateDir(cwd), "prompts");
+}
+
+// Windows paths that refer to the same file can differ in case (drive letter
+// most commonly: `c:\...` vs `C:\...`) without being different paths on
+// disk — NTFS is case-preserving but case-insensitive. Everywhere else, case
+// is significant. path.normalize first so a trailing separator or repeated
+// separators cannot masquerade as a case difference.
+function pathsEqualForOwnership(a, b) {
+  if (process.platform !== "win32") {
+    return a === b;
+  }
+  return path.normalize(a).toLowerCase() === path.normalize(b).toLowerCase();
+}
+
+// Whether real path `child` is (strictly) inside real path `parent`. Both
+// must already be resolved with fs.realpathSync — this does no filesystem
+// access itself, just a path comparison, case-insensitive on win32 to match
+// pathsEqualForOwnership above.
+function isRealPathInside(parentReal, childReal) {
+  if (pathsEqualForOwnership(parentReal, childReal)) {
+    return false;
+  }
+  const parent = process.platform === "win32" ? path.normalize(parentReal).toLowerCase() : parentReal;
+  const child = process.platform === "win32" ? path.normalize(childReal).toLowerCase() : childReal;
+  const parentWithSep = parent.endsWith(path.sep) ? parent : `${parent}${path.sep}`;
+  return child.startsWith(parentWithSep);
+}
+
+// Verifies the prompts directory is what it is supposed to be before
+// anything reads, writes, or deletes through it: not a symlink, not a
+// Windows junction (Node's fs reports those as symbolic links too — same
+// lstat check catches both), a real directory, and its realpath actually
+// lands inside the state directory's realpath rather than some place a
+// symlinked ancestor or a stale mount redirected it to. A prompt file can
+// carry whatever a caller pasted into a rescue request — paths, log
+// excerpts, snippets that might include client data — so silently trusting
+// a redirected directory is never an acceptable default.
+//
+// Returns `{ promptsDir, exists: false }` when nothing is there yet (not a
+// problem — callers that create it, like prompt-path, proceed normally);
+// `{ promptsDir, exists: true, unsafe: "<reason>" }` when something exists
+// but isn't trustworthy; or `{ promptsDir, exists: true, realPromptsDir }`
+// once it has been confirmed safe to use.
+function resolveVerifiedPromptsDir(cwd) {
+  const promptsDir = resolvePromptsDir(cwd);
+
+  let entryStats;
+  try {
+    entryStats = fs.lstatSync(promptsDir);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return { promptsDir, exists: false };
+    }
+    return { promptsDir, exists: true, unsafe: `could not inspect ${promptsDir}: ${error.message}` };
+  }
+
+  if (entryStats.isSymbolicLink()) {
+    return { promptsDir, exists: true, unsafe: `${promptsDir} is a symlink or junction, refusing to use it as the prompts directory` };
+  }
+  if (!entryStats.isDirectory()) {
+    return { promptsDir, exists: true, unsafe: `${promptsDir} exists but is not a directory` };
+  }
+
+  const stateDir = resolveStateDir(cwd);
+  let realPromptsDir;
+  let realStateDir;
+  try {
+    realPromptsDir = fs.realpathSync(promptsDir);
+    realStateDir = fs.realpathSync(stateDir);
+  } catch (error) {
+    return { promptsDir, exists: true, unsafe: `could not resolve the real path of ${promptsDir}: ${error.message}` };
+  }
+
+  if (!isRealPathInside(realStateDir, realPromptsDir)) {
+    return {
+      promptsDir,
+      exists: true,
+      unsafe: `${promptsDir} resolves to ${realPromptsDir}, which is outside its expected state directory ${realStateDir}`
+    };
+  }
+
+  return { promptsDir, exists: true, realPromptsDir };
 }
 
 // Mirrors the workspace-slug sanitizer in lib/state.mjs: keep the label
@@ -1221,7 +1303,11 @@ function ensurePromptsDir(promptsDir) {
   }
 }
 
-function pruneOldPromptFiles(promptsDir, now = Date.now()) {
+// Low-level sweep: assumes `promptsDir` has already been through
+// resolveVerifiedPromptsDir and is safe to read and delete from. Callers
+// (generatePromptFilePath, consumeOneShotPromptFile) verify first and pass
+// the confirmed `promptsDir`; never call this on an unverified path.
+function unlinkStalePromptFiles(promptsDir, now = Date.now()) {
   let entries;
   try {
     entries = fs.readdirSync(promptsDir, { withFileTypes: true });
@@ -1259,14 +1345,36 @@ function pruneOldPromptFiles(promptsDir, now = Date.now()) {
 // Code's Write tool refuses to overwrite a path it has not read, so handing
 // back an already-existing (even empty) file would make the very next step
 // fail.
+//
+// Fail-closed on the prompts directory itself: unlike the cleanup path in
+// consumeOneShotPromptFile (pure housekeeping, must never break an
+// already-accepted task — see safelyConsumeOneShotPromptFile), handing out a
+// path is the one place where writing a prompt — which can carry client
+// data — through a symlinked, junctioned, or otherwise wrong directory must
+// be refused outright rather than silently tolerated.
 function generatePromptFilePath(cwd, label) {
-  const promptsDir = resolvePromptsDir(cwd);
-  ensurePromptsDir(promptsDir);
-  pruneOldPromptFiles(promptsDir);
+  const preCreateVerification = resolveVerifiedPromptsDir(cwd);
+  if (preCreateVerification.exists && preCreateVerification.unsafe) {
+    throw new Error(`Refusing to hand out a prompt file path: ${preCreateVerification.unsafe}`);
+  }
+
+  ensurePromptsDir(preCreateVerification.promptsDir);
+
+  // mkdirSync recursive is a no-op when the path already exists, so the
+  // pre-create check above is what actually guards against a pre-existing
+  // symlink/junction. Re-verifying after creation catches the (much
+  // narrower) case where the directory changed underneath us between the
+  // two calls.
+  const verified = resolveVerifiedPromptsDir(cwd);
+  if (!verified.exists || verified.unsafe) {
+    throw new Error(`Refusing to hand out a prompt file path: ${verified.unsafe ?? "the prompts directory disappeared right after creation"}`);
+  }
+
+  unlinkStalePromptFiles(verified.promptsDir);
 
   const slug = sanitizePromptLabel(label);
   const id = crypto.randomUUID();
-  return path.join(promptsDir, `${slug}-${id}.md`);
+  return path.join(verified.promptsDir, `${slug}-${id}.md`);
 }
 
 function handlePromptPath(argv) {
@@ -1281,36 +1389,33 @@ function handlePromptPath(argv) {
 }
 
 // Whether `promptFilePath` is a file this runtime itself handed out via
-// `prompt-path` — and is therefore ours to delete. Three independent checks,
-// all required, because each guards against a different way a path could
-// look "close enough" without actually being our file:
+// `prompt-path` — and is therefore ours to delete. `verifiedPromptsDir` must
+// already be a *safe* result from resolveVerifiedPromptsDir (checked once by
+// the caller, not re-checked per file). Three independent checks on the file
+// itself, all required, because each guards against a different way a path
+// could look "close enough" without actually being our file:
 //   - name pattern: only `<label>-<uuid>.md` is a shape `prompt-path` would
 //     have generated. Guards a caller's own file dropped into the same
 //     directory under a name we did not choose.
-//   - realpath containment: resolve BOTH the file and the prompts directory
-//     through the filesystem (not string prefix matching) and require the
-//     file's real parent to equal the real prompts directory exactly — one
-//     level, not a subdirectory, and not reachable only via a symlinked
-//     ancestor that makes a lexical prefix match lie.
 //   - lstat on the ORIGINAL (unresolved) path: if the path itself is a
 //     symlink, refuse it. Deleting through a symlink whose target we did not
 //     verify could delete something outside the prompts directory entirely.
-function isOwnedPromptFile(cwd, promptFilePath) {
+//   - realpath containment: resolve the file through the filesystem (not
+//     string prefix matching) and require its real parent to equal the
+//     already-verified real prompts directory exactly — one level, not a
+//     subdirectory.
+function isOwnedPromptFile(promptFilePath, verifiedPromptsDir) {
   if (!PROMPT_FILE_NAME_PATTERN.test(path.basename(promptFilePath))) {
     return false;
   }
 
-  const promptsDir = resolvePromptsDir(cwd);
   let entryStats;
-  let realPromptsDir;
   let realFilePath;
   try {
     entryStats = fs.lstatSync(promptFilePath);
-    realPromptsDir = fs.realpathSync(promptsDir);
     realFilePath = fs.realpathSync(promptFilePath);
   } catch {
-    // Missing, unreadable, or the prompts directory does not exist (nothing
-    // was ever handed out for this workspace) — not ours to touch.
+    // Missing or unreadable — not ours to touch.
     return false;
   }
 
@@ -1318,7 +1423,7 @@ function isOwnedPromptFile(cwd, promptFilePath) {
     return false;
   }
 
-  return path.dirname(realFilePath) === realPromptsDir;
+  return pathsEqualForOwnership(path.dirname(realFilePath), verifiedPromptsDir.realPromptsDir);
 }
 
 // A prompt file handed out by `prompt-path` is single-use: once `task` has
@@ -1327,12 +1432,22 @@ function isOwnedPromptFile(cwd, promptFilePath) {
 // away — bounds how long a prompt that may carry client data sits on disk.
 // Only files this runtime actually owns (see isOwnedPromptFile) are removed;
 // a caller's own file passed via `--prompt-file` from somewhere else, or a
-// same-directory file we did not generate, is never touched.
+// same-directory file we did not generate, is never touched. If the prompts
+// directory itself doesn't verify as safe (see resolveVerifiedPromptsDir),
+// neither the delete nor the sweep below runs — warn and leave everything
+// as-is rather than delete through a symlink/junction we didn't expect.
 // Also re-runs the age sweep here (not just from `prompt-path`), so a
 // directory that only ever sees `task` calls — never a fresh `prompt-path`
 // in between — still gets swept.
 function consumeOneShotPromptFile(cwd, promptFilePath) {
-  if (isOwnedPromptFile(cwd, promptFilePath)) {
+  const verified = resolveVerifiedPromptsDir(cwd);
+
+  if (verified.exists && verified.unsafe) {
+    process.stderr.write(`Warning: skipping prompt file cleanup: ${verified.unsafe}\n`);
+    return;
+  }
+
+  if (verified.exists && isOwnedPromptFile(promptFilePath, verified)) {
     try {
       fs.unlinkSync(promptFilePath);
     } catch {
@@ -1340,7 +1455,30 @@ function consumeOneShotPromptFile(cwd, promptFilePath) {
       // sweep below (and the next prompt-path call) is the backstop.
     }
   }
-  pruneOldPromptFiles(resolvePromptsDir(cwd));
+
+  if (verified.exists) {
+    unlinkStalePromptFiles(verified.promptsDir);
+  }
+}
+
+// Cleanup must never change the outcome of an already-accepted task. By the
+// time either call site below runs, the job is durably queued (background)
+// or the run already executed (foreground) — the caller's jobId and exit
+// code have to reflect THAT, not whatever happened to the housekeeping
+// afterwards. Letting an unexpected cleanup exception reach main()'s catch
+// handler would turn an accepted task into a reported failure with no
+// jobId — and the caller's natural response, retry, would create a
+// duplicate job for work that already started. So: catch, warn on stderr,
+// move on. (consumeOneShotPromptFile itself already warns-and-returns for
+// the specific "prompts directory looks wrong" case; this is the backstop
+// for anything else that slips through.)
+function safelyConsumeOneShotPromptFile(cwd, promptFilePath) {
+  try {
+    consumeOneShotPromptFile(cwd, promptFilePath);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`Warning: could not clean up prompt file ${promptFilePath}: ${detail}\n`);
+  }
 }
 
 function handleTaskResumeCandidate(argv) {

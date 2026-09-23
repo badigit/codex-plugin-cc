@@ -440,3 +440,190 @@ test(
     assert.equal(fs.existsSync(outsideTarget), true);
   }
 );
+
+// Review round 3 (6acb0fe -> this commit): three more gaps.
+//
+// (1) Cleanup running after the task was already accepted must not be able
+//     to turn an accepted task into a reported failure — no jobId, exit
+//     code 1, and a caller that naturally retries and creates a duplicate
+//     job for work that already started.
+// (2) On Windows, ownership comparisons that use string equality on
+//     realpath output can miss a match purely because of drive-letter case
+//     (`c:` vs `C:`), which NTFS does not consider different.
+// (3) The prompts directory itself — not just files inside it — must be
+//     verified: a symlink or Windows junction there redirects every prompt
+//     read/write/delete somewhere else entirely.
+
+test("task --prompt-file still returns a jobId and exit 0 when cleanup's sweep fails (background)", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = buildEnv(binDir);
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  // Sabotage the prompts directory into a plain file: pruneOldPromptFiles's
+  // readdirSync throws ENOTDIR on this, not the ENOENT it already tolerates —
+  // a real failure mode, not a mock.
+  fs.writeFileSync(path.join(stateDir, "prompts"), "not a directory\n", "utf8");
+
+  const ownFile = path.join(repo, "my-own-prompt.md");
+  fs.writeFileSync(ownFile, "Cleanup failure must not cost this run its jobId.\n", "utf8");
+
+  const result = run("node", [SCRIPT, "task", "--background", "--prompt-file", ownFile, "--json"], {
+    cwd: repo,
+    env
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.status, "queued");
+  assert.match(payload.jobId, /^task-/);
+  assert.match(result.stderr, /Warning: skipping prompt file cleanup/i);
+});
+
+test("task --prompt-file still completes successfully when cleanup's sweep fails (foreground)", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = buildEnv(binDir);
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, "prompts"), "not a directory\n", "utf8");
+
+  const ownFile = path.join(repo, "my-own-prompt.md");
+  fs.writeFileSync(ownFile, "Cleanup failure must not break this run.\n", "utf8");
+
+  const result = run("node", [SCRIPT, "task", "--prompt-file", ownFile], {
+    cwd: repo,
+    env
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Handled the requested task/);
+  assert.match(result.stderr, /Warning: skipping prompt file cleanup/i);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.match(fakeState.lastTurnStart.prompt, /Cleanup failure must not break this run\./);
+});
+
+test(
+  "on Windows, a --prompt-file path with a different-case drive letter is still recognized as owned and deleted",
+  { skip: process.platform !== "win32" },
+  () => {
+    const repo = makeTempDir();
+    const binDir = makeTempDir();
+    installFakeCodex(binDir);
+    initGitRepo(repo);
+    fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+    run("git", ["add", "README.md"], { cwd: repo });
+    run("git", ["commit", "-m", "init"], { cwd: repo });
+
+    const env = buildEnv(binDir);
+    const pathResult = promptPath(["--cwd", repo, "--label", "rescue"], { cwd: repo, env });
+    const promptFile = pathResult.stdout.trim();
+    fs.writeFileSync(promptFile, "Case-insensitive drive letter prompt.\n", "utf8");
+
+    assert.match(promptFile, /^[A-Za-z]:/);
+    const driveLetter = promptFile[0];
+    const flippedDriveLetter =
+      driveLetter === driveLetter.toUpperCase() ? driveLetter.toLowerCase() : driveLetter.toUpperCase();
+    const differentCasePath = flippedDriveLetter + promptFile.slice(1);
+    assert.notEqual(differentCasePath, promptFile);
+
+    const result = run("node", [SCRIPT, "task", "--prompt-file", differentCasePath], {
+      cwd: repo,
+      env
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+    assert.match(fakeState.lastTurnStart.prompt, /Case-insensitive drive letter prompt\./);
+    assert.doesNotMatch(result.stderr, /Warning: skipping prompt file cleanup/i);
+    // Deleted under the ORIGINAL casing too — same file on disk either way.
+    assert.equal(fs.existsSync(promptFile), false);
+  }
+);
+
+test(
+  "prompt-path refuses to hand out a path when the prompts directory is itself a symlink/junction (fail-closed)",
+  (t) => {
+    const repo = makeTempDir();
+    const stateDir = resolveStateDir(repo);
+    fs.mkdirSync(stateDir, { recursive: true });
+    const promptsDir = path.join(stateDir, "prompts");
+    const redirectTarget = makeTempDir();
+
+    try {
+      // "junction" is the Windows-specific type that (unlike a plain
+      // symlink) usually does not need elevated privileges; on POSIX the
+      // type argument is ignored and this creates a normal symlink, which
+      // exercises the same isSymbolicLink() check either way.
+      fs.symlinkSync(redirectTarget, promptsDir, "junction");
+    } catch (error) {
+      t.skip(`cannot create a symlink/junction in this environment: ${error.message}`);
+      return;
+    }
+
+    const result = promptPath(["--cwd", repo, "--label", "rescue"], { cwd: repo, env: process.env });
+
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /symlink or junction/i);
+    // Nothing should have been written into the redirected target — the
+    // refusal has to happen before any file is handed out, not after.
+    assert.deepEqual(fs.readdirSync(redirectTarget), []);
+  }
+);
+
+test(
+  "task --prompt-file warns and skips both delete and sweep when the prompts directory is a symlink/junction",
+  (t) => {
+    const repo = makeTempDir();
+    const binDir = makeTempDir();
+    installFakeCodex(binDir);
+    initGitRepo(repo);
+    fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+    run("git", ["add", "README.md"], { cwd: repo });
+    run("git", ["commit", "-m", "init"], { cwd: repo });
+
+    const env = buildEnv(binDir);
+    const stateDir = resolveStateDir(repo);
+    fs.mkdirSync(stateDir, { recursive: true });
+    const promptsDir = path.join(stateDir, "prompts");
+    const redirectTarget = makeTempDir();
+
+    try {
+      fs.symlinkSync(redirectTarget, promptsDir, "junction");
+    } catch (error) {
+      t.skip(`cannot create a symlink/junction in this environment: ${error.message}`);
+      return;
+    }
+
+    // A file inside the redirected target, named exactly like something
+    // prompt-path would generate — if the ownership check trusted the
+    // directory without verifying it first, this would look "ours".
+    const decoyFile = path.join(redirectTarget, `rescue-${crypto.randomUUID()}.md`);
+    fs.writeFileSync(decoyFile, "Must survive: the prompts dir is redirected.\n", "utf8");
+
+    const ownFile = path.join(repo, "my-own-prompt.md");
+    fs.writeFileSync(ownFile, "Task text, unrelated to the redirected directory.\n", "utf8");
+
+    const result = run("node", [SCRIPT, "task", "--prompt-file", ownFile], {
+      cwd: repo,
+      env
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /symlink or junction/i);
+    assert.equal(fs.existsSync(decoyFile), true);
+    assert.equal(fs.existsSync(ownFile), true);
+  }
+);
