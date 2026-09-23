@@ -40,6 +40,17 @@ function defaultState() {
   };
 }
 
+// The root all per-workspace state directories live under: `<CLAUDE_PLUGIN_DATA>/state`
+// when the plugin host provides one, otherwise a fixed fallback under the OS
+// temp directory. Exported as its own function (not just inlined in
+// resolveStateDir) because the scratch-sandbox path-safety checks need to
+// walk from exactly this root down to a given stateDir — see
+// assertScratchDirIsSafeToTouch.
+function resolvePluginDataStateRoot() {
+  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
+  return pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
+}
+
 export function resolveStateDir(cwd) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   let canonicalWorkspaceRoot = workspaceRoot;
@@ -52,9 +63,7 @@ export function resolveStateDir(cwd) {
   const slugSource = path.basename(workspaceRoot) || "workspace";
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
-  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
-  const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
-  return path.join(stateRoot, `${slug}-${hash}`);
+  return path.join(resolvePluginDataStateRoot(), `${slug}-${hash}`);
 }
 
 export function resolveStateFile(cwd) {
@@ -145,7 +154,21 @@ function assertNotInsideRepo(candidatePath, repoRoot, label) {
   }
 }
 
+// `assertPathIsPlainDescendant(stateDir, scratchDir)` alone only walks the
+// path BELOW stateDir (i.e. the single "scratch" segment) — it never lstats
+// stateDir itself. If stateDir's own slot on disk were a junction pointing
+// somewhere that already happens to contain a "scratch" subdirectory, that
+// check would pass while every subsequent read/write/delete actually landed
+// in the junction's target, not in the plugin's real state directory
+// (code-review finding CRITICAL #1, second round). So this also walks from
+// the plugin's data root (resolvePluginDataStateRoot — CLAUDE_PLUGIN_DATA's
+// `state` subdirectory, or the tmp fallback) down to and INCLUDING stateDir
+// itself: `assertPathIsPlainDescendant`'s segment loop lstats every
+// accumulated path, and the final segment IS `to`, so this covers stateDir.
+// Above the data root is out of scope by design — see the threat-model note
+// on resetScratchSandboxDir below.
 function assertScratchDirIsSafeToTouch(stateDir, scratchDir, repoCwd) {
+  assertPathIsPlainDescendant(resolvePluginDataStateRoot(), stateDir);
   assertPathIsPlainDescendant(stateDir, scratchDir);
   assertNotInsideRepo(stateDir, repoCwd, "the plugin state directory");
   assertNotInsideRepo(scratchDir, repoCwd, "the scratch sandbox directory");
@@ -165,6 +188,36 @@ function assertScratchDirIsSafeToTouch(stateDir, scratchDir, repoCwd) {
 // hoisted away, since nothing between the two calls may be trusted to have
 // kept the directory's identity unchanged (code-review finding CRITICAL #2:
 // "проверку повторять непосредственно перед самой очисткой").
+//
+// THREAT MODEL, and what is deliberately NOT closed here (code-review
+// finding CRITICAL #2, second round — TOCTOU between the second check above
+// and the readdir/rm loop below):
+//   - From INSIDE the sandboxed Codex turn itself, the only writable root is
+//     the scratch directory (see buildThreadConfigOverrides in
+//     lib/codex.mjs) — the path components ABOVE scratch (stateDir and its
+//     ancestors up to the plugin data root) are outside every writable root,
+//     so a process running inside that sandbox cannot replace any of them
+//     with a junction. It also cannot escape the race by racing this
+//     specific window, because it cannot touch that part of the path at
+//     all, at any point in time.
+//   - A junction placed INSIDE scratch itself (i.e. one of the entries the
+//     readdir/rm loop below iterates over) is not a problem either:
+//     `fs.rmSync(..., { recursive: true })` lstats each path it recurses
+//     into, so a junction encountered AS AN ENTRY is deleted as the link
+//     itself, without ever being dereferenced into (and deleting) its
+//     target — see the "resetScratchSandboxDir does not follow a junction
+//     placed directly inside scratch when clearing it" test.
+//   - The remaining gap is a race on the path components ABOVE scratch
+//     between the check on the line above and the loop below, but the only
+//     party who could win that race is another process running as the SAME
+//     OS user OUTSIDE the sandbox — and that process already has unrestricted
+//     filesystem access (it can delete or replace anything on disk directly,
+//     sandboxed Codex run or not). Closing this specific TOCTOU window would
+//     not remove any capability such a process doesn't already have, so it
+//     is out of scope: the check exists to fail closed against a
+//     MISCONFIGURATION (a data root that resolves through a junction) and
+//     against the sandboxed Codex process, not against an unsandboxed
+//     co-resident process racing the filesystem.
 export function resetScratchSandboxDir(cwd) {
   const stateDir = resolveStateDir(cwd);
   const dir = resolveScratchSandboxDir(cwd);
@@ -187,11 +240,66 @@ function readScratchSandboxLockOwner(lockFile) {
     const raw = JSON.parse(fs.readFileSync(lockFile, "utf8"));
     return {
       pid: Number.isInteger(raw?.pid) ? raw.pid : null,
-      jobId: typeof raw?.jobId === "string" ? raw.jobId : null
+      jobId: typeof raw?.jobId === "string" ? raw.jobId : null,
+      startedAt: typeof raw?.startedAt === "string" ? raw.startedAt : null
     };
   } catch {
-    return { pid: null, jobId: null };
+    return { pid: null, jobId: null, startedAt: null };
   }
+}
+
+function writeScratchSandboxLock(lockFile, jobId) {
+  fs.writeFileSync(
+    lockFile,
+    JSON.stringify({ pid: process.pid, jobId: jobId ?? null, startedAt: nowIso() }),
+    { flag: "wx" }
+  );
+  return () => {
+    try {
+      const owner = readScratchSandboxLockOwner(lockFile);
+      if (owner.pid === process.pid) {
+        fs.unlinkSync(lockFile);
+      }
+    } catch {
+      // Best-effort: a lock file already gone (or now owned by someone
+      // else, which should not happen but must not throw out of a cleanup
+      // path either way) is not an error here.
+    }
+  };
+}
+
+// A lock is stale — safe to reclaim without waiting out the poll timeout —
+// under any of three conditions (code-review finding IMPORTANT #4, second
+// round): its pid is dead (the original check); its recorded jobId names a
+// job that has already reached a TERMINAL status in this repository's job
+// index (completed/failed/cancelled — the process is alive but is no longer
+// the one that held this lock, e.g. an OS pid reused after the original
+// holder exited); or its jobId is not in the index at all (the job record
+// was pruned or never existed). A lock with no jobId (a foreign/corrupt
+// lock file) can only be judged by pid liveness.
+//
+// Deliberately NOT covered — see resetScratchSandboxDir's threat-model note
+// for the equivalent tradeoff on path safety: a worker that dies mid-run in
+// a way that leaves its job record stuck "running" (an orphaned log without
+// the job index itself being reconciled — reconcileRunningJobs handles the
+// job's OWN status but runs on a different read path than this lock check)
+// is not detected as stale by the jobId rule, only by the pid-liveness rule
+// once that pid is actually gone. The consequence is bounded: the next
+// `--scratch-sandbox` job on this repository waits out the lock timeout and
+// then fails with a clear "busy with job <id>" error — it does not corrupt
+// anything or write to the repository, it just has to be retried.
+function isScratchSandboxLockStale(owner, cwd) {
+  if (!owner.pid || !isProcessAlive(owner.pid)) {
+    return true;
+  }
+  if (!owner.jobId) {
+    return false;
+  }
+  const job = loadState(cwd).jobs.find((candidate) => candidate.id === owner.jobId);
+  if (!job) {
+    return true;
+  }
+  return TERMINAL_JOB_STATUSES.has(job.status);
 }
 
 // Serializes access to the shared, per-repository scratch sandbox directory
@@ -204,7 +312,7 @@ function readScratchSandboxLockOwner(lockFile) {
 //
 // Waits up to `timeoutMs` (default 10 minutes), polling every
 // `pollIntervalMs` (default 2s), for the current holder to release the lock
-// or die — a dead holder's lock (pid no longer alive) is reclaimed
+// or go stale (see isScratchSandboxLockStale) — a stale lock is reclaimed
 // immediately, without waiting out the remaining timeout. Returns a release
 // function; the caller MUST call it (normally from a `finally`) once done.
 export async function acquireScratchSandboxLock(cwd, jobId, options = {}) {
@@ -229,23 +337,7 @@ export async function acquireScratchSandboxLock(cwd, jobId, options = {}) {
 
   for (;;) {
     try {
-      fs.writeFileSync(
-        lockFile,
-        JSON.stringify({ pid: process.pid, jobId: jobId ?? null, createdAt: nowIso() }),
-        { flag: "wx" }
-      );
-      return () => {
-        try {
-          const owner = readScratchSandboxLockOwner(lockFile);
-          if (owner.pid === process.pid) {
-            fs.unlinkSync(lockFile);
-          }
-        } catch {
-          // Best-effort: a lock file already gone (or now owned by someone
-          // else, which should not happen but must not throw out of a
-          // cleanup path either way) is not an error here.
-        }
-      };
+      return writeScratchSandboxLock(lockFile, jobId);
     } catch (error) {
       if (error?.code !== "EEXIST") {
         throw error;
@@ -253,12 +345,89 @@ export async function acquireScratchSandboxLock(cwd, jobId, options = {}) {
     }
 
     const owner = readScratchSandboxLockOwner(lockFile);
-    if (!owner.pid || !isProcessAlive(owner.pid)) {
+    if (isScratchSandboxLockStale(owner, cwd)) {
+      // Test-only instrumentation: widens the window between deciding a
+      // lock is stale and acting on that decision, so
+      // tests/scratch-lock-race-child.mjs can deterministically reproduce
+      // (rather than rely on incidental OS-scheduler timing for) the
+      // takeover-identity race the verification a few lines below this
+      // guards against. Never set outside that test.
+      const debugDelayMs = Number(process.env.CODEX_COMPANION_SCRATCH_LOCK_DEBUG_DELAY_MS);
+      if (Number.isFinite(debugDelayMs) && debugDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, debugDelayMs));
+      }
+      // Atomic takeover, not a plain unlink-then-create: two processes can
+      // both observe the same stale lock at once (code-review finding
+      // IMPORTANT #3, second round). Renaming the stale file to a unique
+      // staging name is the atomic step a filesystem actually guarantees —
+      // exactly one renamer succeeds; every other racer's renameSync gets
+      // ENOENT (the source is already gone) and falls through to retry from
+      // the top of the loop, where it will either see our fresh lock (EEXIST
+      // on its own `wx` attempt) or — if we have not written it yet — race
+      // for the `wx` create itself, which is likewise exclusive.
+      const staleTarget = `${lockFile}.stale-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+      let renamed = false;
       try {
-        fs.unlinkSync(lockFile);
-      } catch {
-        // Raced with someone else already clearing the stale lock — fine,
-        // just retry the acquire above.
+        fs.renameSync(lockFile, staleTarget);
+        renamed = true;
+      } catch (error) {
+        if (error?.code !== "ENOENT") {
+          throw error;
+        }
+      }
+
+      if (renamed) {
+        // renameSync itself does not check WHAT it moved — only that
+        // something existed at lockFile. If enough time passed between
+        // reading `owner` above and this rename (a live OS scheduler
+        // preemption, not just the couple of machine instructions between
+        // this rename and the write below), a DIFFERENT process could have
+        // already legitimately reclaimed the very same stale lock and
+        // published its own fresh one at lockFile in between — and this
+        // rename would have just carried THAT fresh, active lock away, not
+        // the stale one we inspected. Verify identity against what we
+        // renamed before trusting the takeover: if it does not match, put
+        // it back (best-effort) and fall through to retry instead of
+        // treating someone else's live lock as ours to overwrite.
+        const movedOwner = readScratchSandboxLockOwner(staleTarget);
+        const staleTakeoverMismatched =
+          movedOwner.pid !== owner.pid || movedOwner.jobId !== owner.jobId || movedOwner.startedAt !== owner.startedAt;
+        if (staleTakeoverMismatched) {
+          try {
+            fs.renameSync(staleTarget, lockFile);
+          } catch {
+            // Best-effort: if putting it back fails (e.g. a third racer's
+            // own fresh lock already occupies lockFile again by now), the
+            // legitimate holder's OWN lock file is not what we are holding
+            // here — nothing more we can safely do. staleTarget is left
+            // behind as an inert `.stale-<pid>-<rand>` relic either way.
+          }
+          continue;
+        }
+        try {
+          const release = writeScratchSandboxLock(lockFile, jobId);
+          try {
+            fs.unlinkSync(staleTarget);
+          } catch {
+            // Best-effort cleanup of our own staging file — a leftover
+            // `.stale-<pid>-<rand>` file is inert and never looked at again.
+          }
+          return release;
+        } catch (writeError) {
+          // Lost a further race for lockFile itself (a third process's own
+          // takeover of a DIFFERENT stale lock, or a brand-new legitimate
+          // acquire, landed there between our rename and our write). Clean
+          // up the staging file and fall through to retry like any other
+          // contention.
+          try {
+            fs.unlinkSync(staleTarget);
+          } catch {
+            // best-effort
+          }
+          if (writeError?.code !== "EEXIST") {
+            throw writeError;
+          }
+        }
       }
       continue;
     }
