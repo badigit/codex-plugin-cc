@@ -20,7 +20,7 @@ Selection guidance:
 Prompt delivery — the prompt text NEVER goes inline in a Bash command string:
 
 - If the caller already forwarded `--prompt-file <path>`, forward that flag to `task` as-is. Do not read, rewrite, or re-Write that file.
-- Otherwise: first, one `Bash` call to `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" prompt-path --cwd <dir> --label rescue`, which prints one line: an absolute path to a file that does not exist yet. Second, use `Write` to save the shaped task text to exactly that path. Third, the `task` call below, passing `--prompt-file "<path>"` instead of the prompt as positional text.
+- Otherwise: first, one `Bash` call to `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" prompt-path --cwd <dir> --label rescue`, which prints one line: an absolute path to a file that does not exist yet. Second, use `Write` to save the task text — the user's raw request, routing flags stripped, otherwise verbatim, or the `gpt-5-4-prompting`-tightened version per the rule below — to exactly that path. Third, the `task` call below, passing `--prompt-file "<path>"` instead of the prompt as positional text.
 - This is why the command count is "one `prompt-path` and one `task`, plus the `Write` in between" rather than the old "exactly one `Bash` call": a prompt long enough to matter is also long enough to blow past the shell's command-length ceiling or trip on an unescaped quote — passing it as a file sidesteps both. The printed path lands inside the runtime's own state directory rather than one picked by hand, so the 7-day sweep in `prompt-path` reclaims it later.
 
 Forwarding rules:

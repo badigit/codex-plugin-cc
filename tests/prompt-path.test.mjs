@@ -1,7 +1,9 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
@@ -39,7 +41,10 @@ test("prompt-path prints an absolute path inside the state dir's prompts directo
 
   const expectedDir = path.join(resolveStateDir(workspace), "prompts");
   assert.equal(path.dirname(printedPath), expectedDir);
-  assert.match(path.basename(printedPath), /^rescue-[a-z0-9]+-[a-z0-9]{6}\.md$/);
+  assert.match(
+    path.basename(printedPath),
+    /^rescue-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.md$/
+  );
 
   // The directory is created so a subsequent Write can succeed, but the file
   // itself must not exist yet: Claude Code's Write tool refuses to overwrite
@@ -56,7 +61,10 @@ test("prompt-path defaults the label to 'task' when none is given", () => {
 
   assert.equal(result.status, 0, result.stderr);
   const printedPath = result.stdout.trim();
-  assert.match(path.basename(printedPath), /^task-[a-z0-9]+-[a-z0-9]{6}\.md$/);
+  assert.match(
+    path.basename(printedPath),
+    /^task-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.md$/
+  );
 });
 
 test("two prompt-path calls in a row yield two different, not-yet-existing paths", () => {
@@ -96,8 +104,8 @@ test("prompt-path sweeps prompt files older than 7 days but keeps fresh ones", (
   const promptsDir = path.join(resolveStateDir(workspace), "prompts");
   fs.mkdirSync(promptsDir, { recursive: true });
 
-  const oldFile = path.join(promptsDir, "rescue-old-aaaaaa.md");
-  const freshFile = path.join(promptsDir, "rescue-fresh-bbbbbb.md");
+  const oldFile = path.join(promptsDir, `rescue-${crypto.randomUUID()}.md`);
+  const freshFile = path.join(promptsDir, `rescue-${crypto.randomUUID()}.md`);
   fs.writeFileSync(oldFile, "stale prompt\n", "utf8");
   fs.writeFileSync(freshFile, "recent prompt\n", "utf8");
 
@@ -111,6 +119,69 @@ test("prompt-path sweeps prompt files older than 7 days but keeps fresh ones", (
   assert.equal(result.status, 0, result.stderr);
   assert.equal(fs.existsSync(oldFile), false);
   assert.equal(fs.existsSync(freshFile), true);
+});
+
+test("prompt-path's age sweep only removes files matching the runtime's own naming pattern, not a stranger's file", () => {
+  const workspace = makeTempDir();
+  const promptsDir = path.join(resolveStateDir(workspace), "prompts");
+  fs.mkdirSync(promptsDir, { recursive: true });
+
+  // Same directory, same age, but not a name the runtime itself would have
+  // generated (no UUID suffix) — something a human or another tool dropped
+  // in there directly.
+  const strangerFile = path.join(promptsDir, "notes.md");
+  fs.writeFileSync(strangerFile, "unrelated file, not ours to delete\n", "utf8");
+  const eightDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+  fs.utimesSync(strangerFile, eightDaysAgo, eightDaysAgo);
+
+  const result = promptPath(["--cwd", workspace, "--label", "rescue"], { cwd: workspace, env: process.env });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(strangerFile), true);
+});
+
+test("prompt-path creates the prompts directory owner-only (0o700) on POSIX", { skip: process.platform === "win32" }, () => {
+  const workspace = makeTempDir();
+
+  promptPath(["--cwd", workspace, "--label", "rescue"], { cwd: workspace, env: process.env });
+
+  const promptsDir = path.join(resolveStateDir(workspace), "prompts");
+  const mode = fs.statSync(promptsDir).mode & 0o777;
+  assert.equal(mode, 0o700);
+});
+
+test("two concurrent prompt-path calls for the same workspace never collide on a path", async () => {
+  const workspace = makeTempDir();
+
+  const results = await Promise.all(
+    Array.from({ length: 10 }, () =>
+      new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [SCRIPT, "prompt-path", "--cwd", workspace, "--label", "rescue"], {
+          cwd: workspace,
+          env: process.env,
+          windowsHide: true
+        });
+        let stdout = "";
+        child.stdout.on("data", (chunk) => {
+          stdout += chunk;
+        });
+        child.on("error", reject);
+        child.on("close", (code) => {
+          if (code !== 0) {
+            reject(new Error(`prompt-path exited with code ${code}`));
+            return;
+          }
+          resolve(stdout.trim());
+        });
+      })
+    )
+  );
+
+  assert.equal(results.length, 10);
+  assert.equal(new Set(results).size, 10);
+  for (const printedPath of results) {
+    assert.equal(fs.existsSync(printedPath), false);
+  }
 });
 
 test("task --prompt-file reads the path printed by prompt-path and forwards its content as the prompt", () => {
@@ -139,6 +210,38 @@ test("task --prompt-file reads the path printed by prompt-path and forwards its 
 
   const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
   assert.match(fakeState.lastTurnStart.prompt, /Investigate the flaky retry test\./);
+
+  // A one-shot prompt file is deleted right after `task` reads it — waiting
+  // for the next `prompt-path` call's age sweep would leave a prompt that may
+  // carry client data on disk for up to 7 days.
+  assert.equal(fs.existsSync(promptFile), false);
+});
+
+test("task --prompt-file leaves a caller-owned file outside the prompts directory untouched", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = buildEnv(binDir);
+  const ownFile = path.join(repo, "my-own-prompt.md");
+  fs.writeFileSync(ownFile, "A prompt file the caller wrote and manages itself.\n", "utf8");
+
+  const result = run("node", [SCRIPT, "task", "--prompt-file", ownFile], {
+    cwd: repo,
+    env
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.match(fakeState.lastTurnStart.prompt, /A prompt file the caller wrote and manages itself\./);
+
+  // Only files inside <stateDir>/prompts are the runtime's to delete. A file
+  // the caller passed in from elsewhere is never the runtime's to remove.
+  assert.equal(fs.existsSync(ownFile), true);
 });
 
 test("task --background --prompt-file reads the file once up front, not from the detached worker", async () => {
@@ -162,9 +265,13 @@ test("task --background --prompt-file reads the file once up front, not from the
 
   assert.equal(result.status, 0, result.stderr);
 
-  // Deleting the prompt file right after the foreground `task --background`
-  // call returns proves the content was already captured into the queued
-  // job's stored request — a worker that re-reads the path later would fail.
+  // `task` deletes a one-shot prompt file itself, synchronously, in the
+  // foreground call that queues the background job — before any worker has
+  // even started. This already proves the content was captured into the
+  // queued job's stored request rather than left for a worker to re-read the
+  // path later, but rmSync below (force: true, so it is a no-op here) keeps
+  // the test explicit about what property is being exercised.
+  assert.equal(fs.existsSync(promptFile), false);
   fs.rmSync(promptFile, { force: true });
 
   const statePath = path.join(binDir, "fake-codex-state.json");
@@ -184,4 +291,50 @@ test("task --background --prompt-file reads the file once up front, not from the
   );
 
   assert.match(fakeState.lastTurnStart.prompt, /Background rescue prompt\./);
+});
+
+// Regression: readTaskPrompt gained a --prompt-file branch, but the two
+// pre-existing ways of supplying a prompt — positional text and piped stdin —
+// must keep working exactly as before.
+test("task still accepts a positional prompt (no --prompt-file involved)", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = buildEnv(binDir);
+  const result = run("node", [SCRIPT, "task", "investigate the positional prompt path"], {
+    cwd: repo,
+    env
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Handled the requested task/);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.match(fakeState.lastTurnStart.prompt, /investigate the positional prompt path/);
+});
+
+test("task still accepts a prompt piped over stdin (no --prompt-file involved)", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = buildEnv(binDir);
+  const result = run("node", [SCRIPT, "task"], {
+    cwd: repo,
+    env,
+    input: "investigate the piped stdin prompt path\n"
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Handled the requested task/);
+  const fakeState = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.match(fakeState.lastTurnStart.prompt, /investigate the piped stdin prompt path/);
 });

@@ -24,7 +24,8 @@ $ARGUMENTS
 
 Prompt delivery for long requests:
 
-- For a long or multi-paragraph request (pasted logs, a multi-step spec, anything that would strain a shell command line), this command MAY shape the task text itself, run `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" prompt-path --cwd <dir> --label rescue` to get a fresh path, `Write` the shaped text to that exact path, and pass `--prompt-file "<path>"` as part of the request forwarded to the `codex:codex-rescue` subagent. This is preferred over letting the subagent redo the same two steps for a request that is already this long.
+- The file written for `--prompt-file` always holds the user's raw request, routing flags (`--background`/`--wait`/`--model`/`--effort`/`--cwd`/`-C`/`--resume`/`--fresh`) stripped, otherwise verbatim. Nothing in this command rewrites, summarizes, or otherwise reshapes that text — only the `codex:codex-rescue` subagent may tighten it, and only via the `gpt-5-4-prompting` skill as that subagent's rules describe.
+- For a long or multi-paragraph request (pasted logs, a multi-step spec, anything that would strain a shell command line), this command MAY do the `prompt-path` + `Write` steps itself instead of leaving both to the subagent: run `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" prompt-path --cwd <dir> --label rescue` to get a fresh path, `Write` the raw request text to that exact path, and pass `--prompt-file "<path>"` as part of the request forwarded to the `codex:codex-rescue` subagent.
 - For a short request, forwarding the raw text is fine — the subagent performs the same `prompt-path` + `Write` dance itself before calling `task`.
 - Either way, the prompt text itself never appears as literal text inside a `task` Bash command — see Operating rules below.
 

@@ -217,14 +217,36 @@ test("rescue prompt delivery goes through prompt-path and Write, never inline in
   assert.match(rescue, /allowed-tools:\s*Bash\(node:\*\),\s*AskUserQuestion,\s*Agent,\s*Write/);
   assert.match(agent, /prompt text NEVER goes inline in a Bash command string/i);
   assert.match(agent, /prompt-path --cwd <dir> --label rescue/);
-  assert.match(agent, /use `Write` to save the shaped task text to exactly that path/i);
+  assert.match(agent, /use `Write` to save the task text.*routing flags stripped, otherwise verbatim.*to exactly that path/i);
   assert.match(agent, /If the caller already forwarded `--prompt-file <path>`, forward that flag to `task` as-is/i);
   assert.match(rescue, /prompt-path --cwd <dir> --label rescue/);
-  assert.match(rescue, /`Write` the shaped text to that exact path/i);
+  assert.match(rescue, /`Write` the raw request text to that exact path/i);
   assert.match(rescue, /prompt text itself never appears as literal text inside a `task` Bash command/i);
   assert.match(runtimeSkill, /prompt-path --cwd <dir> --label rescue/);
   assert.match(runtimeSkill, /prompt text never goes inline in the `task` command string/i);
   assert.match(runtimeSkill, /task --prompt-file "<path>"/);
+});
+
+test("rescue prompt delivery has one contract, not a shaping loophole: raw text minus routing flags, tightened only via gpt-5-4-prompting", () => {
+  const rescue = read("commands/rescue.md");
+  const agent = read("agents/codex-rescue.md");
+  const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
+
+  // Review finding: commands/rescue.md previously told the main thread it MAY
+  // "shape" a long request before writing it to the prompt file, while the
+  // subagent's own rules say to preserve the user's task text as-is apart
+  // from routing flags. Two different writers of the same file must follow
+  // the same rule, or which one runs first silently decides whether the
+  // prompt gets rewritten.
+  assert.doesNotMatch(rescue, /\bshape\b/i);
+  assert.doesNotMatch(agent, /\bshaped\b/i);
+  assert.doesNotMatch(runtimeSkill, /\bshaped\b/i);
+  assert.match(rescue, /holds the user's raw request, routing flags .* stripped, otherwise verbatim/i);
+  assert.match(rescue, /Nothing in this command rewrites, summarizes, or otherwise reshapes that text/i);
+  assert.match(rescue, /only the `codex:codex-rescue` subagent may tighten it, and only via the `gpt-5-4-prompting` skill/i);
+  assert.match(agent, /Preserve the user's task text as-is apart from stripping routing flags/i);
+  assert.match(agent, /only to tighten the user's request into a better Codex prompt/i);
+  assert.match(runtimeSkill, /Preserve the user's task text as-is apart from stripping routing flags/i);
 });
 
 test("transfer, result, and cancel commands are exposed as deterministic runtime entrypoints", () => {

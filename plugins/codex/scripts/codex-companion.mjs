@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -812,7 +813,15 @@ function resolveTurnHardCeilingMsFromOptions(options) {
 
 function readTaskPrompt(cwd, options, positionals) {
   if (options["prompt-file"]) {
-    return fs.readFileSync(path.resolve(cwd, options["prompt-file"]), "utf8");
+    const promptFilePath = path.resolve(cwd, options["prompt-file"]);
+    const prompt = fs.readFileSync(promptFilePath, "utf8");
+    // Read happens once, here, before `task` branches into foreground vs
+    // `--background` — the text itself (not the path) is what ends up in the
+    // job request, so a detached worker never re-reads this file. Consuming
+    // it now, in the same call, keeps deletion tied to the single read
+    // regardless of which branch runs next.
+    consumeOneShotPromptFile(cwd, promptFilePath);
+    return prompt;
   }
 
   const positionalPrompt = positionals.join(" ");
@@ -1140,11 +1149,21 @@ function handleResult(argv) {
   outputCommandResult(payload, renderStoredJobResult(job, storedJob), options.json);
 }
 
-// Prompt files older than this are swept on every `prompt-path` call. The
-// runtime never deletes a prompt file it wrote (the caller owns cleanup of
-// what it just read), so without this sweep the directory grows one file per
-// rescue run forever.
+// Prompt files older than this are swept whenever we touch the directory
+// (both `prompt-path` handing out a new one and `task` consuming one). The
+// runtime deletes a prompt file itself right after `task --prompt-file`
+// reads it (see consumeOneShotPromptFile below); this sweep is the backstop
+// for whatever a deletion attempt could not clean up — a file left behind by
+// a crashed or cancelled run, a permissions race, a caller that generated a
+// path but never came back to use it.
 const PROMPT_FILE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Matches exactly the names `generatePromptFilePath` produces:
+// `<sanitized-label>-<uuidv4>.md`. The age sweep only ever deletes files
+// matching this, so a caller's own unrelated file dropped into the same
+// directory is never touched even after it goes stale.
+const PROMPT_FILE_NAME_PATTERN =
+  /^[a-zA-Z0-9._-]+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.md$/;
 
 function resolvePromptsDir(cwd) {
   return path.join(resolveStateDir(cwd), "prompts");
@@ -1159,6 +1178,25 @@ function sanitizePromptLabel(label) {
   return slug || "task";
 }
 
+// POSIX: owner-only (0o700). A prompt file can carry whatever the caller
+// pasted into a rescue request — paths, log excerpts, snippets that might
+// include client data — so the directory holding it should not be
+// world/group-readable. On Windows, ACL inheritance from the parent plugin
+// data directory is left as-is: `consumeOneShotPromptFile` below cuts the
+// file's on-disk lifetime to seconds (deleted right after `task` reads it),
+// which stands in for directory-level isolation there instead.
+function ensurePromptsDir(promptsDir) {
+  fs.mkdirSync(promptsDir, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") {
+    try {
+      fs.chmodSync(promptsDir, 0o700);
+    } catch {
+      // Best-effort narrowing. The directory still exists and is usable even
+      // if this particular chmod lost a race or hit a read-only mount.
+    }
+  }
+}
+
 function pruneOldPromptFiles(promptsDir, now = Date.now()) {
   let entries;
   try {
@@ -1171,7 +1209,7 @@ function pruneOldPromptFiles(promptsDir, now = Date.now()) {
   }
 
   for (const entry of entries) {
-    if (!entry.isFile()) {
+    if (!entry.isFile() || !PROMPT_FILE_NAME_PATTERN.test(entry.name)) {
       continue;
     }
     const filePath = path.join(promptsDir, entry.name);
@@ -1199,13 +1237,12 @@ function pruneOldPromptFiles(promptsDir, now = Date.now()) {
 // fail.
 function generatePromptFilePath(cwd, label) {
   const promptsDir = resolvePromptsDir(cwd);
-  fs.mkdirSync(promptsDir, { recursive: true });
+  ensurePromptsDir(promptsDir);
   pruneOldPromptFiles(promptsDir);
 
   const slug = sanitizePromptLabel(label);
-  const timestamp = Date.now().toString(36);
-  const random = Math.random().toString(36).slice(2, 8);
-  return path.join(promptsDir, `${slug}-${timestamp}-${random}.md`);
+  const id = crypto.randomUUID();
+  return path.join(promptsDir, `${slug}-${id}.md`);
 }
 
 function handlePromptPath(argv) {
@@ -1217,6 +1254,34 @@ function handlePromptPath(argv) {
   const cwd = resolveTaskCwd(options);
   const filePath = generatePromptFilePath(cwd, options.label);
   outputCommandResult({ path: filePath }, `${filePath}\n`, options.json);
+}
+
+// A prompt file handed out by `prompt-path` is single-use: once `task` has
+// read it, nothing else ever will. Deleting it immediately — rather than
+// waiting for the next `prompt-path` call's age sweep, which could be days
+// away — bounds how long a prompt that may carry client data sits on disk.
+// Only files inside our own prompts directory are removed; a caller's own
+// file passed via `--prompt-file` from somewhere else is never touched.
+// Also re-runs the age sweep here (not just from `prompt-path`), so a
+// directory that only ever sees `task` calls — never a fresh `prompt-path`
+// in between — still gets swept.
+function consumeOneShotPromptFile(cwd, promptFilePath) {
+  const promptsDir = resolvePromptsDir(cwd);
+  const relative = path.relative(promptsDir, promptFilePath);
+  const isInsidePromptsDir =
+    relative !== "" &&
+    relative !== ".." &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relative);
+  if (isInsidePromptsDir) {
+    try {
+      fs.unlinkSync(promptFilePath);
+    } catch {
+      // Best-effort: already gone, or a permissions/locking race. The age
+      // sweep below (and the next prompt-path call) is the backstop.
+    }
+  }
+  pruneOldPromptFiles(promptsDir);
 }
 
 function handleTaskResumeCandidate(argv) {

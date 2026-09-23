@@ -13,7 +13,7 @@ Primary helpers:
 - `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --prompt-file "<path>" ...`
 
 Prompt delivery:
-- The prompt text never goes inline in the `task` command string. If the caller already forwarded `--prompt-file <path>`, forward it to `task` unchanged and skip `prompt-path`. Otherwise, run `prompt-path` to get a path, `Write` the shaped task text to exactly that path, then call `task --prompt-file "<path>"`.
+- The prompt text never goes inline in the `task` command string. If the caller already forwarded `--prompt-file <path>`, forward it to `task` unchanged and skip `prompt-path`. Otherwise, run `prompt-path` to get a path, `Write` the task text — the user's raw request, routing flags stripped, otherwise verbatim, or the `gpt-5-4-prompting`-tightened version per the rule below — to exactly that path, then call `task --prompt-file "<path>"`.
 - A prompt long enough to matter is also long enough to hit the host's Bash-command-length ceiling or trip on an unescaped quote; a file sidesteps both, and routing the path through `prompt-path` (rather than picking one by hand) puts it under the runtime's own 7-day cleanup sweep.
 
 Execution rules:
