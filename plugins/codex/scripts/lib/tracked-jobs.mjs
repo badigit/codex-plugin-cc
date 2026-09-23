@@ -140,27 +140,6 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
   };
 }
 
-// A background task job's persisted `request` (see codex-companion.mjs's
-// enqueueBackgroundTask) can carry a fully-parsed --output-schema JSON
-// Schema, kept there only so the detached worker did not have to re-read the
-// file mid-run. Once the run is over — success or failure — that copy has
-// served its purpose and would otherwise sit in the job file forever. Strip
-// it from the stored request and leave `outputSchemaUsed: true` as a marker,
-// so a later read of the job can still tell a schema was in play without
-// carrying the schema body itself. The prompt is left untouched — this only
-// targets the schema.
-function sanitizeCompletedJobRecord(record) {
-  if (!record || !record.request || record.request.outputSchema === undefined) {
-    return record;
-  }
-  const { outputSchema, ...requestWithoutSchema } = record.request;
-  return {
-    ...record,
-    request: requestWithoutSchema,
-    outputSchemaUsed: true
-  };
-}
-
 function readStoredJobOrNull(workspaceRoot, jobId) {
   const jobFile = resolveJobFile(workspaceRoot, jobId);
   if (!fs.existsSync(jobFile)) {
@@ -226,23 +205,23 @@ export async function runTrackedJob(job, runner, options = {}) {
     // actually is one, so a successful completion's job record keeps its
     // existing shape (no `errorMessage: null` key added).
     const executionErrorMessage = execution.errorMessage ? { errorMessage: execution.errorMessage } : {};
-    writeJobFile(
-      job.workspaceRoot,
-      job.id,
-      sanitizeCompletedJobRecord({
-        ...runningRecord,
-        status: completionStatus,
-        threadId: execution.threadId ?? null,
-        turnId: execution.turnId ?? null,
-        resolved: execution.resolved ?? null,
-        pid: null,
-        phase: completionStatus === "completed" ? "done" : "failed",
-        completedAt,
-        result: execution.payload,
-        rendered: execution.rendered,
-        ...executionErrorMessage
-      })
-    );
+    // Terminal-status --output-schema cleanup (stripping request.outputSchema,
+    // leaving outputSchemaUsed) happens inside writeJobFile itself — see
+    // sanitizeTerminalJobRecord in state.mjs — not here, so every path that
+    // writes a terminal job record gets it, not just this one.
+    writeJobFile(job.workspaceRoot, job.id, {
+      ...runningRecord,
+      status: completionStatus,
+      threadId: execution.threadId ?? null,
+      turnId: execution.turnId ?? null,
+      resolved: execution.resolved ?? null,
+      pid: null,
+      phase: completionStatus === "completed" ? "done" : "failed",
+      completedAt,
+      result: execution.payload,
+      rendered: execution.rendered,
+      ...executionErrorMessage
+    });
     upsertJob(job.workspaceRoot, {
       id: job.id,
       status: completionStatus,
@@ -265,19 +244,15 @@ export async function runTrackedJob(job, runner, options = {}) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();
-    writeJobFile(
-      job.workspaceRoot,
-      job.id,
-      sanitizeCompletedJobRecord({
-        ...existing,
-        status: "failed",
-        phase: "failed",
-        errorMessage,
-        pid: null,
-        completedAt,
-        logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
-      })
-    );
+    writeJobFile(job.workspaceRoot, job.id, {
+      ...existing,
+      status: "failed",
+      phase: "failed",
+      errorMessage,
+      pid: null,
+      completedAt,
+      logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
+    });
     upsertJob(job.workspaceRoot, {
       id: job.id,
       status: "failed",
@@ -299,18 +274,14 @@ function markWorkerJobDead(workspaceRoot, jobId, logFile, errorMessage) {
   }
   const base = stored ?? { id: jobId, status: "running", logFile };
   const completedAt = nowIso();
-  writeJobFile(
-    workspaceRoot,
-    jobId,
-    sanitizeCompletedJobRecord({
-      ...base,
-      status: "failed",
-      phase: "failed",
-      errorMessage,
-      pid: null,
-      completedAt
-    })
-  );
+  writeJobFile(workspaceRoot, jobId, {
+    ...base,
+    status: "failed",
+    phase: "failed",
+    errorMessage,
+    pid: null,
+    completedAt
+  });
   upsertJob(workspaceRoot, {
     id: jobId,
     status: "failed",

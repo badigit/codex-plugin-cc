@@ -225,10 +225,48 @@ export function getConfig(cwd) {
   return loadState(cwd).config;
 }
 
+const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
+// A background task job's persisted `request` (see codex-companion.mjs's
+// enqueueBackgroundTask) can carry a fully-parsed --output-schema JSON
+// Schema, kept there only so the detached worker did not have to re-read the
+// file mid-run. Once the job reaches a terminal status that copy has served
+// its purpose and would otherwise sit in the job file forever — but a job
+// gets to a terminal status through several independent paths: a normal run
+// finishing (success or failure) or crashing (tracked-jobs.mjs), `cancel`
+// (codex-companion.mjs), a dead worker's stale "running"/"queued" record
+// being reconciled (reconcileRunningJobs below), or the Claude session
+// ending while a job is still active (session-lifecycle-hook.mjs). Every one
+// of those writes the job record through writeJobFile, so sanitizing here —
+// the one choke point all of them share — is what actually guarantees the
+// schema is stripped everywhere, instead of relying on each call site to
+// remember to do it itself. The prompt is left untouched — this only targets
+// the schema — and a job NOT reaching a terminal status (queued, running, or
+// restored to its previous live status after a failed cancellation attempt,
+// see settleCancellationAfterTermination in job-control.mjs) is passed
+// through unchanged.
+function sanitizeTerminalJobRecord(payload) {
+  if (
+    !payload ||
+    !TERMINAL_JOB_STATUSES.has(payload.status) ||
+    !payload.request ||
+    payload.request.outputSchema === undefined
+  ) {
+    return payload;
+  }
+  const { outputSchema, ...requestWithoutSchema } = payload.request;
+  return {
+    ...payload,
+    request: requestWithoutSchema,
+    outputSchemaUsed: true
+  };
+}
+
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  const sanitizedPayload = sanitizeTerminalJobRecord(payload);
+  fs.writeFileSync(jobFile, `${JSON.stringify(sanitizedPayload, null, 2)}\n`, "utf8");
   return jobFile;
 }
 

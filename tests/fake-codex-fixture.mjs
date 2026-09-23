@@ -984,6 +984,15 @@ rl.on("line", (line) => {
 	            }
 	          });
 	          send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "failed") } });
+	        } else if (BEHAVIOR === "turn-fails-without-explanation") {
+	          // A turn that ends non-"completed" with NEITHER an "error"
+	          // notification NOR anything on stderr — no agentMessage either.
+	          // Exercises the synthetic errorMessage fallback in
+	          // executeTaskRun/describeUnexplainedTaskFailure: without it, a
+	          // job that fails this way had null errorMessage and nothing
+	          // useful for the result command to show.
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "failed") } });
 	        } else {
 	          emitTurnCompleted(thread.id, turnId, items);
 	        }

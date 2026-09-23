@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
@@ -76,6 +77,31 @@ function writeSchema(dir, name, value) {
   const schemaPath = path.join(dir, name);
   fs.writeFileSync(schemaPath, JSON.stringify(value, null, 2), "utf8");
   return schemaPath;
+}
+
+async function waitFor(predicate, { timeoutMs = 15000, intervalMs = 100 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    // A predicate that reads a JSON file on disk (state.json, a job file) can
+    // race a concurrent writer mid-write — a worker process or this very
+    // companion rewriting it between our read and JSON.parse. Treat a parse
+    // failure as "not yet", not a hard error, and let the next poll retry.
+    let value;
+    try {
+      value = predicate();
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        value = null;
+      } else {
+        throw error;
+      }
+    }
+    if (value) {
+      return value;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error("Timed out waiting for condition.");
 }
 
 async function waitForFinishedJob(scriptArgs, cwd, env, jobId, timeoutMs = 15000) {
@@ -338,4 +364,120 @@ test("task --output-schema --background strips the schema from the completed job
   assert.equal(resultPayload.storedJob.outputSchemaUsed, true);
   // The prompt itself is untouched — only the schema body is stripped.
   assert.equal(resultPayload.storedJob.request.prompt, "run a check");
+});
+
+test("a task turn that fails with neither an app-server error nor stderr still gets a synthetic errorMessage", () => {
+  const { repo, env } = setUpRepo("turn-fails-without-explanation");
+
+  const result = run("node", [SCRIPT, "task", "--json", "run a check"], {
+    cwd: repo,
+    env
+  });
+
+  // The turn ended non-"completed" with no explanation of its own — the
+  // command's exit status still reflects the failed turn, and it produced no
+  // final message (errorMessage lives on the stored job, not this payload —
+  // checked below via `result --json`).
+  assert.notEqual(result.status, 0);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.rawOutput, "");
+
+  const stored = run("node", [SCRIPT, "result", "--json"], { cwd: repo, env });
+  assert.equal(stored.status, 0, stored.stderr);
+  const storedPayload = JSON.parse(stored.stdout);
+  assert.equal(storedPayload.job.status, "failed");
+  assert.equal(typeof storedPayload.job.errorMessage, "string");
+  assert.notEqual(storedPayload.job.errorMessage, "");
+  assert.match(storedPayload.job.errorMessage, /Codex turn ended with status failed and no error message\./);
+});
+
+test("cancel strips --output-schema from the job file, leaving outputSchemaUsed and status cancelled", async () => {
+  const { repo, env } = setUpRepo("interruptible-slow-task");
+  const schemaPath = writeSchema(repo, "schema.json", REVIEW_FINDINGS_SCHEMA);
+  const stateDir = resolveStateDir(repo);
+  const stateFile = path.join(stateDir, "state.json");
+
+  const launch = run(
+    "node",
+    [SCRIPT, "task", "--output-schema", schemaPath, "--background", "--json", "investigate the flaky worker timeout"],
+    { cwd: repo, env }
+  );
+  assert.equal(launch.status, 0, launch.stderr);
+  const jobId = JSON.parse(launch.stdout).jobId;
+
+  await waitFor(() => {
+    const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    const job = state.jobs.find((candidate) => candidate.id === jobId);
+    return job?.status === "running" && job.threadId && job.turnId ? job : null;
+  });
+
+  // Sanity check: a genuinely still-running job keeps the schema — this is
+  // the baseline cancel is expected to change.
+  const jobFile = path.join(stateDir, "jobs", `${jobId}.json`);
+  const runningStored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  assert.equal(runningStored.request.outputSchema !== undefined, true);
+
+  const cancelResult = run("node", [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+  assert.equal(cancelResult.status, 0, cancelResult.stderr);
+  assert.equal(JSON.parse(cancelResult.stdout).status, "cancelled");
+
+  const cancelledStored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  assert.equal(cancelledStored.status, "cancelled");
+  assert.equal("outputSchema" in cancelledStored.request, false);
+  assert.equal(cancelledStored.outputSchemaUsed, true);
+  assert.equal(cancelledStored.request.prompt, "investigate the flaky worker timeout");
+});
+
+test("reconciling a background job whose worker died strips --output-schema from the job file", async () => {
+  const { repo, env } = setUpRepo("interruptible-slow-task");
+  const schemaPath = writeSchema(repo, "schema.json", REVIEW_FINDINGS_SCHEMA);
+  const stateDir = resolveStateDir(repo);
+  const stateFile = path.join(stateDir, "state.json");
+
+  const launch = run(
+    "node",
+    [SCRIPT, "task", "--output-schema", schemaPath, "--background", "--json", "investigate the flaky worker timeout"],
+    { cwd: repo, env }
+  );
+  assert.equal(launch.status, 0, launch.stderr);
+  const jobId = JSON.parse(launch.stdout).jobId;
+
+  await waitFor(() => {
+    const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    const job = state.jobs.find((candidate) => candidate.id === jobId);
+    return job?.status === "running" ? job : null;
+  });
+
+  // Sanity check: a genuinely still-running job keeps the schema — this is
+  // the baseline the dead-worker reconcile below is expected to change.
+  const jobFile = path.join(stateDir, "jobs", `${jobId}.json`);
+  const runningStored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  assert.equal(runningStored.request.outputSchema !== undefined, true);
+
+  // Simulate the detached worker crashing mid-run: still "running" on disk,
+  // but its pid is dead. reconcileRunningJobs (state.mjs) is what a later
+  // listJobs() read (here, via `status`) flips this to "failed" through.
+  const exitedWorker = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  const deadPid = exitedWorker.pid;
+  await new Promise((resolve, reject) => {
+    exitedWorker.once("error", reject);
+    exitedWorker.once("exit", resolve);
+  });
+
+  const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  const nextState = {
+    ...state,
+    jobs: state.jobs.map((candidate) => (candidate.id === jobId ? { ...candidate, pid: deadPid } : candidate))
+  };
+  fs.writeFileSync(stateFile, `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+
+  const status = run("node", [SCRIPT, "status", jobId, "--json"], { cwd: repo, env });
+  assert.equal(status.status, 0, status.stderr);
+  assert.equal(JSON.parse(status.stdout).job.status, "failed");
+
+  const reconciledStored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  assert.equal(reconciledStored.status, "failed");
+  assert.equal("outputSchema" in reconciledStored.request, false);
+  assert.equal(reconciledStored.outputSchemaUsed, true);
+  assert.equal(reconciledStored.request.prompt, "investigate the flaky worker timeout");
 });

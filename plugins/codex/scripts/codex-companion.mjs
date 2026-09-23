@@ -569,6 +569,20 @@ async function executeReviewRun(request) {
 }
 
 
+// A failed turn (exitStatus != 0) normally carries a reason: the app-server's
+// own "error" notification (folded into failureMessage above) or stderr from
+// a dead process. But a turn can also come back resolved (not thrown) with a
+// non-"completed" status and NEITHER of those — e.g. an interrupted turn, or
+// a future app-server status this runtime does not special-case. Without a
+// fallback here, errorMessage stayed null and a failed job's `result` had
+// nothing to show for why it failed. Prefer the app-server's own turn.status
+// string ("failed", "interrupted", ...) when there is one; fall back to the
+// raw numeric exit status otherwise.
+function describeUnexplainedTaskFailure(result) {
+  const status = result.turn?.status ?? result.status;
+  return `Codex turn ended with status ${status} and no error message.`;
+}
+
 async function executeTaskRun(request) {
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
   ensureCodexAvailable(request.cwd);
@@ -653,8 +667,11 @@ async function executeTaskRun(request) {
     // here rather than throwing — exitStatus is just non-zero. Without this,
     // runTrackedJob's success branch (see tracked-jobs.mjs) never persisted
     // an errorMessage on the job at all, unlike a thrown precondition error,
-    // and `result` silently fell back to nothing useful to show.
-    errorMessage: result.status === 0 ? null : failureMessage || null,
+    // and `result` silently fell back to nothing useful to show. When the
+    // turn failed but left no failureMessage of its own (no app-server
+    // "error" notification, no stderr), fall back to a synthetic one instead
+    // of null — see describeUnexplainedTaskFailure above.
+    errorMessage: result.status === 0 ? null : failureMessage || describeUnexplainedTaskFailure(result),
     jobTitle: taskMetadata.title,
     jobClass: "task",
     write: Boolean(request.write)
