@@ -28,7 +28,7 @@ Execution rules:
 - Leave `--effort` unset unless the user explicitly requests a specific effort.
 - Leave model unset by default. Add `--model` only when the user explicitly asks for one.
 - Map `spark` to `--model gpt-5.3-codex-spark`.
-- Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits; in those cases, add `--read-only` instead.
+- Default to a write-capable Codex run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits; in those cases, add `--read-only` instead. If the run needs to actually execute the repository's own tests (not just read them) while staying read-only, add `--scratch-sandbox` instead of `--read-only`: it keeps the repository read-only but gives Codex a writable scratch directory (with TEMP/TMP pointed there) so tempfile-based test suites can run.
 
 Command selection:
 - Use exactly one `task` invocation per rescue handoff.
