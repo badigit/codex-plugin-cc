@@ -142,6 +142,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|terra|luna>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|terra|luna>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--read-only] [--cwd <dir>] [--prompt-file <path>] [--output-schema <path>] [--resume-last|--resume|--fresh] [--label <task|review|rescue>] [--model <model|spark|sol|terra|luna>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [prompt]",
+      "    --output-schema forwards a JSON Schema to Codex's structured output; `result --json`/`task --json` then carry the parsed answer as `structured`. The companion only JSON.parses the answer — schema conformance is enforced by Codex's own strict structured-output mode, not validated here.",
       "  node scripts/codex-companion.mjs prompt-path [--cwd <dir>] [--label <name>] [--json]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
@@ -647,6 +648,13 @@ async function executeTaskRun(request) {
     payload,
     rendered,
     summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
+    // A turn that legitimately fails (the app-server rejects the model's
+    // output against --output-schema in strict mode, for example) returns
+    // here rather than throwing — exitStatus is just non-zero. Without this,
+    // runTrackedJob's success branch (see tracked-jobs.mjs) never persisted
+    // an errorMessage on the job at all, unlike a thrown precondition error,
+    // and `result` silently fell back to nothing useful to show.
+    errorMessage: result.status === 0 ? null : failureMessage || null,
     jobTitle: taskMetadata.title,
     jobClass: "task",
     write: Boolean(request.write)
@@ -754,7 +762,12 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, readOnly, resumeL
     jobId,
     turnTimeoutMs,
     hardCeilingMs,
-    outputSchema: outputSchema ?? null
+    // Only present when a schema was actually requested. This request object
+    // is what a background job persists as storedJob.request (see
+    // enqueueBackgroundTask/handleTaskWorker below) — an unconditional
+    // `outputSchema: null` here would show up as a new key on every
+    // background task's stored job, schema or not.
+    ...(outputSchema ? { outputSchema } : {})
   };
 }
 

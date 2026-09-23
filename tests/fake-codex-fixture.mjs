@@ -255,11 +255,17 @@ function structuredReviewPayload(prompt) {
     return "not valid json";
   }
 
+  // Generic verdict-schema answer, used by task --output-schema outside the
+  // adversarial-review prompt above. Shaped like the workshop's
+  // review-findings.json (verdict + findings only — no summary/next_steps,
+  // which that schema does not declare) rather than reusing the richer
+  // adversarial-review shape, since the companion never validates the answer
+  // against the caller's schema itself (see structured-output.mjs) and tests
+  // exercising --output-schema should not accidentally depend on a shape
+  // wider than what a real --output-schema caller is likely to declare.
   return JSON.stringify({
     verdict: "approve",
-    summary: "No material issues found.",
-    findings: [],
-    next_steps: []
+    findings: []
   });
 }
 
@@ -959,6 +965,25 @@ rl.on("line", (line) => {
 	            setTimeout(reasoningTick, reasoningGapMs);
 	          };
 	          setTimeout(reasoningTick, reasoningGapMs);
+	        } else if (BEHAVIOR === "schema-rejected") {
+	          // The app-server's OWN rejection of a --output-schema turn: the
+	          // model's final answer did not conform to output_schema in strict
+	          // mode. Distinct from "reject-gpt-5.6" above (an RPC-level error
+	          // response to turn/start itself, before a turn ever starts, which
+	          // throws synchronously) — here the turn is accepted and runs, no
+	          // agentMessage item is ever completed, and it ends via
+	          // turn/completed with a non-"completed" status plus an "error"
+	          // notification carrying the server's rejection text.
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          send({
+	            method: "error",
+	            params: {
+	              threadId: thread.id,
+	              turnId,
+	              error: { message: "Model output did not conform to output_schema: missing required property 'verdict'." }
+	            }
+	          });
+	          send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "failed") } });
 	        } else {
 	          emitTurnCompleted(thread.id, turnId, items);
 	        }
