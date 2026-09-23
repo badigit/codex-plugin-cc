@@ -21,7 +21,7 @@ const readline = require("node:readline");
 
 	function loadState() {
 	  if (!fs.existsSync(STATE_PATH)) {
-	    return { nextThreadId: 1, nextTurnId: 1, appServerStarts: 0, threads: [], capabilities: null, lastInterrupt: null, lastAppServerSpawnArgs: null, lastReviewStart: null };
+	    return { nextThreadId: 1, nextTurnId: 1, appServerStarts: 0, turnStartCount: 0, threads: [], capabilities: null, lastInterrupt: null, lastAppServerSpawnArgs: null, lastReviewStart: null };
 	  }
 	  return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
 	}
@@ -389,7 +389,48 @@ rl.on("line", (line) => {
 	          cwd: message.params.cwd ?? null
 	        };
 	        saveState(state);
-	        send({ id: message.id, result: { thread: buildThread(thread), model: selectedModel, modelProvider, serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: selectedEffort } });
+	        // Mirrors the real app-server (codex-cli 0.153.4, verified with a
+	        // direct thread/start probe): a workspace-write request echoes
+	        // networkAccess/excludeTmpdirEnvVar/excludeSlashTmp from the
+	        // sandbox_workspace_write config overlay, but ALWAYS returns an
+	        // EMPTY writableRoots regardless of the writable_roots override --
+	        // see validateScratchSandboxThreadStart in lib/scratch-sandbox.mjs
+	        // for why that empty array is not itself treated as a violation.
+	        let ackCwd = thread.cwd;
+	        let sandboxAck;
+	        if (message.params.sandbox === "workspace-write") {
+	          const overlay = message.params.config?.sandbox_workspace_write ?? {};
+	          sandboxAck = {
+	            type: "workspaceWrite",
+	            writableRoots: [],
+	            networkAccess: overlay.network_access ?? false,
+	            excludeTmpdirEnvVar: overlay.exclude_tmpdir_env_var ?? false,
+	            excludeSlashTmp: overlay.exclude_slash_tmp ?? false
+	          };
+	        } else {
+	          sandboxAck = { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false };
+	        }
+	        // Test-only knob (BEHAVIOR="scratch-mismatch:<field>"): corrupts one
+	        // field of the ack to prove companion's fail-closed check in
+	        // validateScratchSandboxThreadStart actually rejects a mismatch
+	        // instead of just happening to see a correct ack every time.
+	        if (BEHAVIOR.startsWith("scratch-mismatch:")) {
+	          const mismatchField = BEHAVIOR.slice("scratch-mismatch:".length);
+	          if (mismatchField === "cwd") {
+	            ackCwd = path.join(thread.cwd, "not-the-scratch-dir");
+	          } else if (mismatchField === "type") {
+	            sandboxAck = { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false };
+	          } else if (mismatchField === "networkAccess") {
+	            sandboxAck = { ...sandboxAck, networkAccess: true };
+	          } else if (mismatchField === "writableRoots") {
+	            sandboxAck = { ...sandboxAck, writableRoots: [path.dirname(thread.cwd)] };
+	          } else if (mismatchField === "excludeTmpdirEnvVar") {
+	            sandboxAck = { ...sandboxAck, excludeTmpdirEnvVar: false };
+	          } else if (mismatchField === "excludeSlashTmp") {
+	            sandboxAck = { ...sandboxAck, excludeSlashTmp: false };
+	          }
+	        }
+	        send({ id: message.id, result: { thread: buildThread(thread), model: selectedModel, modelProvider, serviceTier: null, cwd: ackCwd, approvalPolicy: "never", sandbox: sandboxAck, reasoningEffort: selectedEffort } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
       }
@@ -595,6 +636,12 @@ rl.on("line", (line) => {
       }
 
 	      case "turn/start": {
+		        // Counted regardless of BEHAVIOR/outcome below: this is what
+		        // proves a rejected scratch-sandbox thread/start ack (see the
+		        // "scratch-mismatch:*" BEHAVIOR above) never reaches turn/start
+		        // at all, not just that the run ends up failed for some reason.
+		        state.turnStartCount = (state.turnStartCount || 0) + 1;
+		        saveState(state);
 		        if (BEHAVIOR === "stalled-turn-start") {
 		          // Never respond — simulates app-server alive but network stalled.
 		          // companion's deadline must timeout and reject.

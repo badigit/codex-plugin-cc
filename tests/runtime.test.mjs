@@ -1711,7 +1711,12 @@ test("task --scratch-sandbox points the app-server thread at a scratch directory
   assert.equal(fakeState.lastThreadStart.sandbox, "workspace-write");
   assert.equal(fakeState.lastThreadStart.cwd, scratchDir);
   assert.notEqual(fakeState.lastThreadStart.cwd, repo);
-  assert.deepEqual(fakeState.lastThreadStart.config?.sandbox_workspace_write, { writable_roots: [scratchDir] });
+  assert.deepEqual(fakeState.lastThreadStart.config?.sandbox_workspace_write, {
+    writable_roots: [scratchDir],
+    network_access: false,
+    exclude_tmpdir_env_var: true,
+    exclude_slash_tmp: true
+  });
   assert.deepEqual(fakeState.lastThreadStart.config?.shell_environment_policy, {
     set: { TEMP: scratchDir, TMP: scratchDir }
   });
@@ -1824,6 +1829,151 @@ test("task --scratch-sandbox --background finds its job by repository via status
   const resultPayload = JSON.parse(result.stdout);
   assert.equal(resultPayload.job.id, launchPayload.jobId);
   assert.equal(resultPayload.job.status, "completed");
+  // Surfaced per code-review finding IMPORTANT #7: the ACTUAL resolved
+  // sandbox policy, not just what was requested. Lives under the stored
+  // job's `result` (execution.payload), same as rawOutput/touchedFiles —
+  // NOT under the lighter `job` snapshot `status` also uses (that one only
+  // carries resolved/threadId/turnId/summary, see tracked-jobs.mjs's
+  // upsertJob call).
+  assert.deepEqual(resultPayload.storedJob.result.sandboxEffective, {
+    type: "workspaceWrite",
+    cwd: resolveScratchSandboxDir(repo),
+    writableRoots: [],
+    networkAccess: false
+  });
+});
+
+test("task --scratch-sandbox rejects --read-only (self-contained sandbox mode, no other flag needed)", () => {
+  const result = run("node", [SCRIPT, "task", "--read-only", "--scratch-sandbox", "run the tests"], {
+    cwd: ROOT
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--scratch-sandbox is a self-contained sandbox mode/);
+});
+
+test("task --scratch-sandbox rejects --resume-last before any app-server call", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--scratch-sandbox", "--resume-last", "run the tests"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /cannot be combined with --resume\/--resume-last/);
+  // Proof that this was rejected BEFORE touching the app-server at all: no
+  // fake-codex state file was ever written (thread/start was never sent),
+  // and no companion job/state directory exists either.
+  assert.equal(fs.existsSync(path.join(binDir, "fake-codex-state.json")), false);
+  assert.equal(fs.existsSync(path.join(resolveStateDir(repo), "state.json")), false);
+});
+
+test("task --scratch-sandbox rejects --resume before any app-server call", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+
+  const firstRun = run("node", [SCRIPT, "task", "initial task"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+
+  const result = run("node", [SCRIPT, "task", "--scratch-sandbox", "--resume", "follow up"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /cannot be combined with --resume\/--resume-last/);
+});
+
+test("task --scratch-sandbox aborts BEFORE turn/start when the app-server's thread/start ack does not honor the requested policy", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  // Corrupts the thread/start ack's cwd field — see fake-codex-fixture.mjs's
+  // "scratch-mismatch:*" BEHAVIOR support.
+  installFakeCodex(binDir, "scratch-mismatch:cwd");
+  initGitRepo(repo);
+
+  const result = run("node", [SCRIPT, "task", "--scratch-sandbox", "run the tests"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.notEqual(result.status, 0, "must fail closed on a policy mismatch");
+  assert.match(result.stderr, /did not honor the requested sandbox policy/);
+  assert.match(result.stderr, /resolved cwd/);
+
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  // The whole point of the check: it must run and reject BEFORE turn/start
+  // is ever sent, not just leave the run failed for some other reason.
+  assert.equal(fakeState.turnStartCount || 0, 0, "turn/start must never be called after a policy mismatch");
+
+  const storedJob = readPersistedJob(repo);
+  assert.equal(storedJob.status, "failed");
+  assert.match(storedJob.errorMessage, /did not honor the requested sandbox policy/);
+});
+
+test("task --scratch-sandbox: a second job on the same repository waits for the scratch lock, then times out while the first is still running", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  // Never responds to turn/start — job A holds the scratch lock for as long
+  // as this test needs it to, without having to wait out any real turn.
+  installFakeCodex(binDir, "stalled-turn-start");
+  initGitRepo(repo);
+
+  const jobAEnv = { ...buildEnv(binDir) };
+  const launchA = run(
+    "node",
+    [SCRIPT, "task", "--background", "--scratch-sandbox", "--json", "job A holds the scratch lock"],
+    { cwd: repo, env: jobAEnv }
+  );
+  assert.equal(launchA.status, 0, launchA.stderr);
+  const jobAId = JSON.parse(launchA.stdout).jobId;
+
+  try {
+    // Wait for job A to actually be inside its turn (i.e. past
+    // resetScratchSandboxDir and holding the lock) before racing job B.
+    await waitFor(() => {
+      const status = run("node", [SCRIPT, "status", jobAId, "--json"], { cwd: repo, env: jobAEnv });
+      if (status.status !== 0) {
+        return null;
+      }
+      const payload = JSON.parse(status.stdout);
+      return payload.job.status === "running" ? payload : null;
+    });
+
+    // job B: short lock timeout/poll interval via env so the test does not
+    // wait anywhere near the real 10-minute default.
+    const jobBEnv = {
+      ...buildEnv(binDir),
+      CODEX_COMPANION_SCRATCH_LOCK_TIMEOUT_MS: "800",
+      CODEX_COMPANION_SCRATCH_LOCK_POLL_INTERVAL_MS: "100"
+    };
+    const start = Date.now();
+    const resultB = run(
+      "node",
+      [SCRIPT, "task", "--scratch-sandbox", "job B should be refused, not corrupt job A's scratch"],
+      { cwd: repo, env: jobBEnv }
+    );
+    const elapsed = Date.now() - start;
+
+    assert.notEqual(resultB.status, 0, "job B must fail while job A holds the scratch lock");
+    assert.match(resultB.stderr, new RegExp(`busy with job ${jobAId}`));
+    assert.ok(elapsed < 10000, `must fail fast on the short test timeout, not the real 10-minute default (took ${elapsed}ms)`);
+  } finally {
+    // Best-effort cleanup: the global test teardown also reaps orphaned
+    // background workers/brokers, but cancel it directly so this test does
+    // not depend on that timing.
+    run("node", [SCRIPT, "cancel", jobAId, "--json"], { cwd: repo, env: jobAEnv });
+  }
 });
 
 test("review accepts (ignores) positional focus text for parity with adversarial-review", () => {
