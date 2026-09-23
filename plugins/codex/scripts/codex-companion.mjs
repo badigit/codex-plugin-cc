@@ -29,6 +29,7 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  resetScratchSandboxDir,
   resolveStateDir,
   setConfig,
   upsertJob,
@@ -134,6 +135,19 @@ function modelAliases(env = process.env) {
 }
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
+// Prepended to the prompt for `task --scratch-sandbox` (see executeTaskRun):
+// the sandbox's cwd is the scratch directory, not the repository, so Codex
+// needs to be told explicitly where the repository actually is and that it
+// has to `cd` there to inspect it or run commands against it.
+function buildScratchSandboxPreamble(repoAbsPath) {
+  return (
+    `The current directory is a scratch sandbox, not the repository. ` +
+    `The repository is available read-only at ${repoAbsPath} — run \`cd ${repoAbsPath}\` first to inspect it or run commands (including tests) against it. ` +
+    `Write any temporary files, test artifacts, or command output only in the current directory (the scratch sandbox). ` +
+    `Do not attempt to modify anything inside the repository; those writes will be denied.`
+  );
+}
+
 function printUsage() {
   console.log(
     [
@@ -141,8 +155,9 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|terra|luna>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model|spark|sol|terra|luna>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--read-only] [--cwd <dir>] [--prompt-file <path>] [--output-schema <path>] [--resume-last|--resume|--fresh] [--label <task|review|rescue>] [--model <model|spark|sol|terra|luna>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--read-only] [--scratch-sandbox] [--cwd <dir>] [--prompt-file <path>] [--output-schema <path>] [--resume-last|--resume|--fresh] [--label <task|review|rescue>] [--model <model|spark|sol|terra|luna>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [prompt]",
       "    --output-schema forwards a JSON Schema to Codex's structured output; `result --json`/`task --json` then carry the parsed answer as `structured`. The companion only JSON.parses the answer — schema conformance is enforced by Codex's own strict structured-output mode, not validated here.",
+      "    --scratch-sandbox runs Codex with a workspace-write sandbox rooted at a per-repository scratch directory instead of the repository itself, with TEMP/TMP pointed there too — for running the repo's own tests, which often need a writable temp dir even under a read-only review. The repository stays read-only (reachable via `cd <repo>` inside the sandbox); combine with --write to write to the repository is rejected.",
       "  node scripts/codex-companion.mjs prompt-path [--cwd <dir>] [--label <name>] [--json]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
@@ -607,13 +622,36 @@ async function executeTaskRun(request) {
     throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
   }
 
-  const result = await runAppServerTurn(workspaceRoot, {
+  // --scratch-sandbox: run Codex against a persistent per-repository scratch
+  // directory instead of the repository itself. cwd (and therefore the sole
+  // workspace-write writable root — see buildThreadConfigOverrides in
+  // lib/codex.mjs) becomes the scratch directory, TEMP/TMP are pointed at it
+  // so tempfile-based tests get a writable temp dir under the sandbox, and
+  // the prompt is told where the real repository is and that it is
+  // read-only. The repository itself is never made a writable root here.
+  let runCwd = workspaceRoot;
+  let envOverrides;
+  let writableRoots;
+  let promptForRun = request.prompt;
+  if (request.scratchSandbox) {
+    const scratchDir = resetScratchSandboxDir(workspaceRoot);
+    runCwd = scratchDir;
+    envOverrides = { TEMP: scratchDir, TMP: scratchDir };
+    writableRoots = [scratchDir];
+    if (request.prompt) {
+      promptForRun = `${buildScratchSandboxPreamble(workspaceRoot)}\n\n${request.prompt}`;
+    }
+  }
+
+  const result = await runAppServerTurn(runCwd, {
     resumeThreadId,
-    prompt: request.prompt,
+    prompt: promptForRun,
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
     effort: request.effort,
-    sandbox: request.write ? "workspace-write" : request.readOnly ? "read-only" : null,
+    sandbox: request.scratchSandbox ? "workspace-write" : request.write ? "workspace-write" : request.readOnly ? "read-only" : null,
+    envOverrides,
+    writableRoots,
     outputSchema: request.outputSchema ?? null,
     onProgress: request.onProgress,
     persistThread: true,
@@ -766,7 +804,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, readOnly, resumeLast, label, jobId, turnTimeoutMs, hardCeilingMs, outputSchema }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, readOnly, scratchSandbox, resumeLast, label, jobId, turnTimeoutMs, hardCeilingMs, outputSchema }) {
   return {
     cwd,
     model,
@@ -774,6 +812,7 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, readOnly, resumeL
     prompt,
     write,
     readOnly,
+    scratchSandbox,
     resumeLast,
     label,
     jobId,
@@ -1030,7 +1069,7 @@ async function handleReview(argv) {
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["model", "effort", "cwd", "prompt-file", "output-schema", "turn-timeout-ms", "label"],
-    booleanOptions: ["json", "write", "read-only", "resume-last", "resume", "fresh", "background"],
+    booleanOptions: ["json", "write", "read-only", "scratch-sandbox", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
     }
@@ -1057,6 +1096,10 @@ async function handleTask(argv) {
   if (write && readOnly) {
     throw new Error("Choose either --write or --read-only.");
   }
+  const scratchSandbox = Boolean(options["scratch-sandbox"]);
+  if (scratchSandbox && write) {
+    throw new Error("Choose either --write or --scratch-sandbox (--scratch-sandbox keeps the repository read-only; only the scratch directory is writable).");
+  }
   // Names the thread in the Codex app's session list. Closed set, because the
   // prefix doubles as the lookup key for --resume-last (see lib/task-thread.mjs).
   const label = normalizeTaskLabel(options.label);
@@ -1077,6 +1120,7 @@ async function handleTask(argv) {
       prompt,
       write,
       readOnly,
+      scratchSandbox,
       resumeLast,
       label,
       jobId: job.id,
@@ -1109,6 +1153,7 @@ async function handleTask(argv) {
         prompt,
         write,
         readOnly,
+        scratchSandbox,
         resumeLast,
         label,
         jobId: job.id,

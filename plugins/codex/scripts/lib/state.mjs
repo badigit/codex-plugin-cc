@@ -12,6 +12,15 @@ const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+// `task --scratch-sandbox` writable-away-from-the-repo directory. Deliberately
+// a FIXED path per repository (same state dir the rest of this module keys by
+// cwd), not a fresh mkdtemp per run: on Windows, Codex's sandbox grants a
+// synthetic SID write access to each distinct writable root it sees, and that
+// SID sticks around as a dangling ACE once the directory is gone (see
+// tooling/codex-cli.md, cap_sid / codex-acl-gc.ps1 in the tooling repo). A
+// one-shot temp dir per invocation would grow that ACL by one entry every
+// run; reusing the same path lets Codex reuse the SID it already granted.
+const SCRATCH_SANDBOX_DIR_NAME = "scratch";
 export const UNREPORTED_PROCESS_EXIT_MESSAGE = "Process exited without reporting.";
 
 function nowIso() {
@@ -55,6 +64,29 @@ export function resolveJobsDir(cwd) {
 
 export function ensureStateDir(cwd) {
   fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
+}
+
+// Path only — does not create the directory. `cwd` here is always the
+// REPOSITORY, never the scratch directory itself: resolveStateDir keys off
+// resolveWorkspaceRoot(cwd), and the scratch directory is not (and must not
+// become) a git repository.
+export function resolveScratchSandboxDir(cwd) {
+  return path.join(resolveStateDir(cwd), SCRATCH_SANDBOX_DIR_NAME);
+}
+
+// Create the scratch sandbox directory if missing, and otherwise clear its
+// CONTENTS before a run — never delete/recreate the directory itself (that
+// would hand Codex a directory it has never granted a writable root to,
+// forcing Windows to mint a fresh synthetic SID; see the comment on
+// SCRATCH_SANDBOX_DIR_NAME above). A previous run's leftovers must not leak
+// into the next one, so this always runs before starting the sandboxed turn.
+export function resetScratchSandboxDir(cwd) {
+  const dir = resolveScratchSandboxDir(cwd);
+  fs.mkdirSync(dir, { recursive: true });
+  for (const entry of fs.readdirSync(dir)) {
+    fs.rmSync(path.join(dir, entry), { recursive: true, force: true });
+  }
+  return dir;
 }
 
 export function loadState(cwd) {

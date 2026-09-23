@@ -157,6 +157,36 @@ function cleanCodexStderr(stderr) {
 // read-only pin is not honored on resume.
 const DEFAULT_SANDBOX = null;
 
+// Builds the `config` overlay shared by thread/start and thread/resume. Keys
+// mirror config.toml's own top-level tables — the app-server merges this
+// object into the resolved config the same way `-c key=value`/`-c
+// key.sub=value` does for `codex exec` — so `envOverrides` becomes
+// `shell_environment_policy.set` (the TOML table that maps env var name to
+// value for every shell command the turn runs) and `writableRoots` becomes
+// `sandbox_workspace_write.writable_roots`.
+//
+// Both are used together by `task --scratch-sandbox` (see
+// codex-companion.mjs): the scratch directory is the sole writable root, and
+// TEMP/TMP are pointed at it so tempfile-based tooling (Python's
+// tempfile.TemporaryDirectory, Node's fs.mkdtemp with no explicit prefix
+// path, …) resolves its temp directory to somewhere the sandbox actually
+// allows writes — on Windows a workspace-write sandbox denies writes to the
+// real %TEMP% just like it denies writes to the repository, which is the bug
+// this whole flag exists to work around.
+function buildThreadConfigOverrides(options = {}) {
+  const config = {};
+  if (options.effort) {
+    config.model_reasoning_effort = options.effort;
+  }
+  if (options.envOverrides && Object.keys(options.envOverrides).length > 0) {
+    config.shell_environment_policy = { set: { ...options.envOverrides } };
+  }
+  if (Array.isArray(options.writableRoots) && options.writableRoots.length > 0) {
+    config.sandbox_workspace_write = { writable_roots: options.writableRoots };
+  }
+  return Object.keys(config).length > 0 ? config : null;
+}
+
 /** @returns {ThreadStartParams} */
 function buildThreadParams(cwd, options = {}) {
   return {
@@ -164,7 +194,7 @@ function buildThreadParams(cwd, options = {}) {
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
     sandbox: options.sandbox ?? DEFAULT_SANDBOX,
-    config: options.effort ? { model_reasoning_effort: options.effort } : null,
+    config: buildThreadConfigOverrides(options),
     serviceName: SERVICE_NAME,
     ephemeral: options.ephemeral ?? true
   };
@@ -177,7 +207,8 @@ function buildResumeParams(threadId, cwd, options = {}) {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? DEFAULT_SANDBOX
+    sandbox: options.sandbox ?? DEFAULT_SANDBOX,
+    config: buildThreadConfigOverrides(options)
   };
 }
 
@@ -1563,7 +1594,9 @@ export async function runAppServerTurn(cwd, options = {}) {
       response = await resumeThread(client, options.resumeThreadId, cwd, {
         model: options.model,
         sandbox: options.sandbox,
-        ephemeral: false
+        ephemeral: false,
+        envOverrides: options.envOverrides,
+        writableRoots: options.writableRoots
       });
       threadSelection = response;
     } else {
@@ -1572,7 +1605,9 @@ export async function runAppServerTurn(cwd, options = {}) {
         model: options.model,
         sandbox: options.sandbox,
         ephemeral: options.persistThread ? false : true,
-        threadName: options.persistThread ? options.threadName : options.threadName ?? null
+        threadName: options.persistThread ? options.threadName : options.threadName ?? null,
+        envOverrides: options.envOverrides,
+        writableRoots: options.writableRoots
       });
       threadSelection = response;
     }
