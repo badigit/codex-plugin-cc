@@ -30,6 +30,7 @@ import {
   acquireScratchSandboxLock,
   generateJobId,
   getConfig,
+  isDeadWorkerFailure,
   listJobs,
   resetScratchSandboxDir,
   resolveStateDir,
@@ -421,14 +422,15 @@ function filterJobsForCurrentClaudeSession(jobs) {
   return jobs.filter((job) => job.sessionId === sessionId);
 }
 
-function findLatestResumableTaskJob(jobs) {
+function findLatestResumableTaskJob(jobs, options = {}) {
   return (
     jobs.find(
       (job) =>
         job.jobClass === "task" &&
         job.threadId &&
         job.status !== "queued" &&
-        job.status !== "running"
+        job.status !== "running" &&
+        (!options.excludeDeadWorkerFailures || !isDeadWorkerFailure(job))
     ) ?? null
   );
 }
@@ -1670,7 +1672,7 @@ function handleTaskResumeCandidate(argv) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const sessionId = getCurrentClaudeSessionId();
   const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
-  const candidate = findLatestResumableTaskJob(jobs);
+  const candidate = findLatestResumableTaskJob(jobs, { excludeDeadWorkerFailures: true });
 
   const payload = {
     available: Boolean(candidate),

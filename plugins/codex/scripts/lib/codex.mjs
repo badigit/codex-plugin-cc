@@ -1443,6 +1443,10 @@ export async function runAppServerReview(cwd, options = {}) {
   }
 
   return withAppServer(cwd, async (client) => {
+    options.onProgress?.({
+      message: "",
+      brokerEndpoint: client.transport === "broker" ? client.endpoint : null
+    });
     // Ревью — такой же делегированный прогон, как задача, и его тред обязан
     // исчезать из списка сессий Codex ровно так же. Архивацию в fork.10
     // получил только runAppServerTurn, и этот путь остался видимым: 107 тредов
@@ -1593,6 +1597,10 @@ export async function runAppServerTurn(cwd, options = {}) {
   }
 
   return withAppServer(cwd, async (client) => {
+    options.onProgress?.({
+      message: "",
+      brokerEndpoint: client.transport === "broker" ? client.endpoint : null
+    });
     // Короткое имя модели доразрешаем по каталогу аккаунта ДО старта треда:
     // иначе сервер отвечает про неизвестную модель, а человек видит только
     // «прогон упал». Полное имя проходит здесь без изменений.

@@ -19,7 +19,8 @@ function normalizeProgressEvent(value) {
       resolved: value.resolved && typeof value.resolved === "object" && !Array.isArray(value.resolved) ? value.resolved : null,
       stderrMessage: value.stderrMessage == null ? null : String(value.stderrMessage).trim(),
       logTitle: typeof value.logTitle === "string" && value.logTitle.trim() ? value.logTitle.trim() : null,
-      logBody: value.logBody == null ? null : String(value.logBody).trimEnd()
+      logBody: value.logBody == null ? null : String(value.logBody).trimEnd(),
+      brokerEndpoint: Object.hasOwn(value, "brokerEndpoint") ? value.brokerEndpoint : undefined
     };
   }
 
@@ -31,7 +32,8 @@ function normalizeProgressEvent(value) {
     resolved: null,
     stderrMessage: String(value ?? "").trim(),
     logTitle: null,
-    logBody: null
+    logBody: null,
+    brokerEndpoint: undefined
   };
 }
 
@@ -74,6 +76,7 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
   let lastThreadId = null;
   let lastTurnId = null;
   let lastResolved = null;
+  let lastBrokerEndpoint;
 
   return (event) => {
     const normalized = normalizeProgressEvent(event);
@@ -101,6 +104,12 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
     if (normalized.resolved && normalized.resolved !== lastResolved) {
       lastResolved = normalized.resolved;
       patch.resolved = normalized.resolved;
+      changed = true;
+    }
+
+    if (normalized.brokerEndpoint !== undefined && normalized.brokerEndpoint !== lastBrokerEndpoint) {
+      lastBrokerEndpoint = normalized.brokerEndpoint;
+      patch.brokerEndpoint = normalized.brokerEndpoint;
       changed = true;
     }
 

@@ -11,6 +11,7 @@ const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
+const BROKER_STATE_FILE_NAME = "broker.json";
 const MAX_JOBS = 50;
 // `task --scratch-sandbox` writable-away-from-the-repo directory. Deliberately
 // a FIXED path per repository (same state dir the rest of this module keys by
@@ -25,9 +26,20 @@ const SCRATCH_SANDBOX_LOCK_FILE_NAME = "scratch.lock";
 export const DEFAULT_SCRATCH_SANDBOX_LOCK_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_SCRATCH_SANDBOX_LOCK_POLL_INTERVAL_MS = 2000;
 export const UNREPORTED_PROCESS_EXIT_MESSAGE = "Process exited without reporting.";
+const WORKER_PROCESS_EXIT_REASON = "worker-process-exited";
+const BROKER_RESTARTED_WORKER_GONE_REASON = "broker-restarted-worker-gone";
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+export function isDeadWorkerFailure(job) {
+  return (
+    job?.status === "failed" &&
+    (job.failureReason === WORKER_PROCESS_EXIT_REASON ||
+      job.failureReason === BROKER_RESTARTED_WORKER_GONE_REASON ||
+      job.errorMessage === UNREPORTED_PROCESS_EXIT_MESSAGE)
+  );
 }
 
 function defaultState() {
@@ -533,8 +545,46 @@ export function upsertJob(cwd, jobPatch) {
   });
 }
 
+function loadCurrentBrokerEndpoint(cwd) {
+  const brokerStateFile = path.join(resolveStateDir(cwd), BROKER_STATE_FILE_NAME);
+  if (!fs.existsSync(brokerStateFile)) {
+    return null;
+  }
+  try {
+    const endpoint = JSON.parse(fs.readFileSync(brokerStateFile, "utf8"))?.endpoint;
+    return typeof endpoint === "string" && endpoint ? endpoint : null;
+  } catch {
+    return null;
+  }
+}
+
+function deadWorkerFailure(job, currentBrokerEndpoint) {
+  if (job.brokerEndpoint && currentBrokerEndpoint && job.brokerEndpoint !== currentBrokerEndpoint) {
+    return {
+      failureReason: BROKER_RESTARTED_WORKER_GONE_REASON,
+      errorMessage: `Broker restarted (endpoint ${job.brokerEndpoint} -> ${currentBrokerEndpoint}); worker pid ${job.pid} is gone.`
+    };
+  }
+  return {
+    failureReason: WORKER_PROCESS_EXIT_REASON,
+    errorMessage: UNREPORTED_PROCESS_EXIT_MESSAGE
+  };
+}
+
+function appendReconciliationLog(logFile, message) {
+  if (!logFile || !message) {
+    return;
+  }
+  try {
+    fs.appendFileSync(logFile, `[${nowIso()}] Marked failed: ${message}\n`, "utf8");
+  } catch {
+    // Reconciliation must still persist the authoritative state when the log is unavailable.
+  }
+}
+
 function reconcileRunningJobs(cwd, state) {
   const completedAt = nowIso();
+  const currentBrokerEndpoint = loadCurrentBrokerEndpoint(cwd);
   const staleJobs = [];
   const jobs = state.jobs.map((job) => {
     // "queued" also needs reconciling: enqueueBackgroundTask records the
@@ -553,6 +603,7 @@ function reconcileRunningJobs(cwd, state) {
       return job;
     }
 
+    const failure = deadWorkerFailure(job, currentBrokerEndpoint);
     const failedJob = {
       ...job,
       status: "failed",
@@ -560,7 +611,7 @@ function reconcileRunningJobs(cwd, state) {
       pid: null,
       completedAt,
       updatedAt: completedAt,
-      errorMessage: UNREPORTED_PROCESS_EXIT_MESSAGE
+      ...failure
     };
     staleJobs.push(failedJob);
     return failedJob;
@@ -572,6 +623,7 @@ function reconcileRunningJobs(cwd, state) {
 
   const nextState = saveState(cwd, { ...state, jobs });
   for (const job of staleJobs) {
+    appendReconciliationLog(job.logFile, job.errorMessage);
     const jobFile = resolveJobFile(cwd, job.id);
     if (!fs.existsSync(jobFile)) {
       continue;
@@ -583,7 +635,8 @@ function reconcileRunningJobs(cwd, state) {
         phase: job.phase,
         pid: job.pid,
         completedAt: job.completedAt,
-        errorMessage: job.errorMessage
+        errorMessage: job.errorMessage,
+        failureReason: job.failureReason
       });
     } catch {
       // The state record is still authoritative when a per-job file is unreadable.

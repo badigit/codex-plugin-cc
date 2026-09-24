@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { homeEnv, initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { homeEnv, initGitRepo, makeTempDir, run, scaleTimeout } from "./helpers.mjs";
 import { loadBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import {
   resolveCancelableJob,
@@ -1541,17 +1541,25 @@ test("task --background preserves --read-only through the detached worker", asyn
   assert.equal(launchPayload.status, "queued");
   assert.match(launchPayload.jobId, /^task-/);
 
-  const runningJob = await waitFor(() => {
-    try {
-      const storedJob = readPersistedJob(repo, launchPayload.jobId);
-      return storedJob.status === "running" && storedJob.resolved ? storedJob : null;
-    } catch {
-      return null;
-    }
-  });
+  const runningJob = await waitFor(
+    () => {
+      try {
+        const storedJob = readPersistedJob(repo, launchPayload.jobId);
+        return storedJob.status === "running" && storedJob.resolved ? storedJob : null;
+      } catch {
+        return null;
+      }
+    },
+    { timeoutMs: scaleTimeout(5000) }
+  );
   assert.deepEqual(runningJob.resolved, FAKE_RESOLVED_SETTINGS);
+  const brokerSession = loadBrokerSession(repo);
+  assert.ok(brokerSession, "expected the background task to use the shared broker");
+  assert.equal(runningJob.brokerEndpoint, brokerSession.endpoint);
   const runningState = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "state.json"), "utf8"));
-  assert.deepEqual(runningState.jobs.find((job) => job.id === launchPayload.jobId).resolved, FAKE_RESOLVED_SETTINGS);
+  const runningStateJob = runningState.jobs.find((job) => job.id === launchPayload.jobId);
+  assert.deepEqual(runningStateJob.resolved, FAKE_RESOLVED_SETTINGS);
+  assert.equal(runningStateJob.brokerEndpoint, brokerSession.endpoint);
 
   const waitedStatus = run(
     "node",
@@ -2380,7 +2388,7 @@ test("status --wait times out cleanly when a job is still active", () => {
   assert.equal(payload.waitTimedOut, true);
 });
 
-test("status and resume candidates mark a running job with a dead pid as failed", async () => {
+test("status --wait reports a dead worker after a broker restart and resume candidates skip it", async () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
   const jobsDir = path.join(stateDir, "jobs");
@@ -2396,6 +2404,8 @@ test("status and resume candidates mark a running job with a dead pid as failed"
   const jobId = "task-stale";
   const logFile = path.join(jobsDir, `${jobId}.log`);
   const jobFile = path.join(jobsDir, `${jobId}.json`);
+  const previousBrokerEndpoint = "pipe:\\\\.\\pipe\\cxc-previous-codex-app-server";
+  const currentBrokerEndpoint = "pipe:\\\\.\\pipe\\cxc-current-codex-app-server";
   const staleJob = {
     id: jobId,
     status: "running",
@@ -2406,6 +2416,7 @@ test("status and resume candidates mark a running job with a dead pid as failed"
     threadId: "thr_stale",
     summary: "Investigate flaky test",
     pid: deadPid,
+    brokerEndpoint: previousBrokerEndpoint,
     logFile,
     createdAt: "2026-03-18T15:30:00.000Z",
     startedAt: "2026-03-18T15:30:01.000Z",
@@ -2418,27 +2429,86 @@ test("status and resume candidates mark a running job with a dead pid as failed"
     `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [staleJob] }, null, 2)}\n`,
     "utf8"
   );
+  fs.writeFileSync(
+    path.join(stateDir, "broker.json"),
+    `${JSON.stringify({ endpoint: currentBrokerEndpoint }, null, 2)}\n`,
+    "utf8"
+  );
 
   const env = { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-stale" };
+  const statusResult = run(
+    "node",
+    [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "2000", "--poll-interval-ms", "100", "--json"],
+    { cwd: workspace, env }
+  );
+  assert.equal(statusResult.status, 0, statusResult.stderr);
+  const status = JSON.parse(statusResult.stdout);
+  assert.equal(status.job.status, "failed");
+  assert.equal(status.waitTimedOut, false);
+  assert.equal(
+    status.job.errorMessage,
+    `Broker restarted (endpoint ${previousBrokerEndpoint} -> ${currentBrokerEndpoint}); worker pid ${deadPid} is gone.`
+  );
+
   const candidateResult = run("node", [SCRIPT, "task-resume-candidate", "--json"], { cwd: workspace, env });
   assert.equal(candidateResult.status, 0, candidateResult.stderr);
   const candidate = JSON.parse(candidateResult.stdout);
-  assert.equal(candidate.available, true);
-  assert.equal(candidate.candidate.status, "failed");
-
-  const statusResult = run("node", [SCRIPT, "status", "--json"], { cwd: workspace, env });
-  assert.equal(statusResult.status, 0, statusResult.stderr);
-  const status = JSON.parse(statusResult.stdout);
-  assert.deepEqual(status.running, []);
-  assert.equal(status.latestFinished.status, "failed");
-  assert.equal(status.latestFinished.errorMessage, "Process exited without reporting.");
+  assert.equal(candidate.available, false);
 
   const persistedState = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
   assert.equal(persistedState.jobs[0].status, "failed");
   assert.equal(persistedState.jobs[0].pid, null);
   const persistedJob = JSON.parse(fs.readFileSync(jobFile, "utf8"));
   assert.equal(persistedJob.status, "failed");
-  assert.equal(persistedJob.errorMessage, "Process exited without reporting.");
+  assert.equal(persistedJob.errorMessage, status.job.errorMessage);
+  assert.match(fs.readFileSync(logFile, "utf8"), /Marked failed: Broker restarted/);
+});
+
+test("a live worker remains running when the broker endpoint changes", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const jobId = "task-live-old-broker";
+  const logFile = path.join(jobsDir, `${jobId}.log`);
+  const liveJob = {
+    id: jobId,
+    status: "running",
+    phase: "running",
+    title: "Codex Task",
+    jobClass: "task",
+    sessionId: "sess-live-old-broker",
+    pid: process.pid,
+    brokerEndpoint: "pipe:\\\\.\\pipe\\cxc-previous-codex-app-server",
+    logFile,
+    createdAt: "2026-03-18T15:30:00.000Z",
+    startedAt: "2026-03-18T15:30:01.000Z",
+    updatedAt: "2026-03-18T15:30:02.000Z"
+  };
+  fs.writeFileSync(logFile, "[2026-03-18T15:30:00.000Z] Starting Codex Task.\n", "utf8");
+  fs.writeFileSync(path.join(jobsDir, `${jobId}.json`), `${JSON.stringify(liveJob, null, 2)}\n`, "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [liveJob] }, null, 2)}\n`,
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(stateDir, "broker.json"),
+    `${JSON.stringify({ endpoint: "pipe:\\\\.\\pipe\\cxc-current-codex-app-server" }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "25", "--json"], {
+    cwd: workspace,
+    env: { ...process.env, CODEX_COMPANION_SESSION_ID: "sess-live-old-broker" }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.job.status, "running");
+  assert.equal(payload.waitTimedOut, true);
+  assert.doesNotMatch(fs.readFileSync(logFile, "utf8"), /Marked failed/);
 });
 
 test("result returns the stored output for the latest finished job by default", () => {
