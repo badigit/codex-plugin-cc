@@ -292,6 +292,27 @@ test("the contract tells the caller to collect a backgrounded rescue result", ()
   assert.match(rescueCommand, /run that exact command yourself via `Bash\(\.\.\., run_in_background: true\)`/i);
   assert.match(rescueCommand, /Do not run `wait` inline\/foreground/i);
   assert.match(rescueCommand, /arrive as a notification/i);
+
+  // Code-review finding #3 on the first cut: the doc claimed the wait command
+  // sat on "the receipt's last non-empty line", which broke the moment an
+  // explanatory line was added after it. Docs and the renderer must agree on
+  // one fixed extraction anchor: a `WAIT: ` marker line.
+  assert.match(rescueCommand, /line starting with `WAIT: `/i);
+  assert.doesNotMatch(rescueCommand, /last non-empty line/i);
+});
+
+test("the WAIT: marker the docs point at is the exact marker codex-companion.mjs prints", () => {
+  const source = read("scripts/codex-companion.mjs");
+  const rescueCommand = read("commands/rescue.md");
+  const resultHandling = read("skills/codex-result-handling/SKILL.md");
+
+  // renderQueuedTaskLaunch must actually print the marker the docs tell the
+  // caller to parse — a doc/code mismatch here silently strands every
+  // backgrounded rescue run, since the caller would be extracting from a line
+  // that no longer exists.
+  assert.match(source, /`WAIT: \$\{payload\.waitCommand\}`/);
+  assert.match(rescueCommand, /`WAIT: `/);
+  assert.match(resultHandling, /`WAIT: `/);
 });
 
 test("internal docs use task terminology for rescue runs", () => {

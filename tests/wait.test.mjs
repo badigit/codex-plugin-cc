@@ -20,6 +20,19 @@ function initRepoWithCommit(repo) {
   run("git", ["commit", "-m", "init"], { cwd: repo });
 }
 
+// Mirrors codex-companion.mjs's buildCompanionCommand quoting exactly (it is
+// not exported) so the retry-command assertions below can compare the WHOLE
+// string, not just check that `wait <id> --cwd` appears somewhere in it —
+// code-review finding #2 wants the caller's own flags (--timeout-ms, --json)
+// preserved verbatim in the retry line, and a substring match would not catch
+// them silently going missing.
+function quoteArg(part) {
+  return /[\s"']/.test(part) ? `"${part.replace(/"/g, '\\"')}"` : part;
+}
+function expectedWaitCommand(args) {
+  return ["node", SCRIPT, ...args].map(quoteArg).join(" ");
+}
+
 function launchBackgroundTask(repo, binDir, prompt) {
   const launched = run("node", [SCRIPT, "task", "--background", "--json", prompt], {
     cwd: repo,
@@ -141,11 +154,18 @@ test("wait exits 2 with a retry line when --timeout-ms runs out while the job is
 
   assert.equal(result.status, 2, result.stderr);
   assert.match(result.stdout, /task-live has not finished yet \(running\)/);
-  assert.match(result.stdout, new RegExp(`wait task-live --cwd`));
+  // The retry line must carry the SAME --timeout-ms the caller passed, not
+  // drop it and hand back a 30-minute default retry — and must NOT gain a
+  // --json the caller never asked for.
+  const expectedTextRetry = expectedWaitCommand(["wait", "task-live", "--cwd", workspace, "--timeout-ms", "25"]);
+  assert.ok(
+    result.stdout.includes(`Retry: ${expectedTextRetry}`),
+    `expected retry command ${JSON.stringify(expectedTextRetry)} in:\n${result.stdout}`
+  );
 
   const resultJson = run(
     "node",
-    [SCRIPT, "wait", "task-live", "--timeout-ms", "25", "--cwd", workspace, "--json"],
+    [SCRIPT, "wait", "task-live", "--timeout-ms", "25", "--poll-interval-ms", "10", "--cwd", workspace, "--json"],
     { cwd: workspace }
   );
   assert.equal(resultJson.status, 2, resultJson.stderr);
@@ -153,7 +173,18 @@ test("wait exits 2 with a retry line when --timeout-ms runs out while the job is
   assert.equal(payload.status, "timeout");
   assert.equal(payload.job.id, "task-live");
   assert.equal(payload.job.status, "running");
-  assert.match(payload.retryCommand, /wait task-live --cwd/);
+  const expectedJsonRetry = expectedWaitCommand([
+    "wait",
+    "task-live",
+    "--cwd",
+    workspace,
+    "--timeout-ms",
+    "25",
+    "--poll-interval-ms",
+    "10",
+    "--json"
+  ]);
+  assert.equal(payload.retryCommand, expectedJsonRetry);
 
   // Timing out must not touch the job's own status — it is still running,
   // not failed, and a later `wait` must find the same live job.
@@ -238,4 +269,183 @@ test("wait fails after the retry budget for a job id that genuinely does not exi
 
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /No job found for "task-does-not-exist"/);
+});
+
+// Code-review finding #1 on the first cut: the job-index-appear wait and the
+// active-status wait were two INDEPENDENT budgets stacked back to back, so a
+// caller's own --timeout-ms only bounded the second half — a job id that
+// never appears at all waited out the full 15s default regardless of what
+// --timeout-ms said. There is now one deadline for the whole call.
+test("wait's --timeout-ms bounds the WHOLE call, including the job-index-appear wait, not just the active-status wait", () => {
+  const workspace = makeTempDir();
+
+  const startedAt = Date.now();
+  const result = run(
+    "node",
+    [SCRIPT, "wait", "typo-job-id", "--timeout-ms", "1000", "--poll-interval-ms", "2000", "--cwd", workspace],
+    { cwd: workspace }
+  );
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /No job found for "typo-job-id"/);
+  // Must stop close to the requested 1000ms, not the 15s index-retry default
+  // (WAIT_JOB_INDEX_RETRY_MS) the earlier, unbounded version fell back to.
+  // Deliberately NOT scaleTimeout()'d: the old bug's duration is a flat
+  // 15000ms regardless of machine load (a plain constant, not real spawned
+  // work), so a scaled bound could exceed it under heavy contention and stop
+  // telling the two apart. 6000ms unscaled stays a decisive margin above the
+  // expected ~1000-1500ms and well under the 15000ms bug it must catch.
+  assert.ok(
+    elapsedMs < 6000,
+    `expected wait to give up near --timeout-ms 1000, took ${elapsedMs}ms`
+  );
+});
+
+test("a job that appears mid-wait is only waited for the REMAINDER of --timeout-ms, not a fresh full budget", async () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const jobId = "task-appear-still-running";
+  const logFile = path.join(jobsDir, `${jobId}.log`);
+  const jobFile = path.join(jobsDir, `${jobId}.json`);
+  const stateFile = path.join(stateDir, "state.json");
+  // Appears partway through the caller's own --timeout-ms budget below, and
+  // stays "running" forever after that — so the ONLY way this call can time
+  // out at all is if the active-status wait actually got bounded by what was
+  // left of the total budget, not a fresh one.
+  const appearDelayMs = scaleTimeout(1200);
+  const totalTimeoutMs = scaleTimeout(3000);
+
+  const writerSource = `
+    const fs = require("fs");
+    setTimeout(() => {
+      const job = {
+        id: ${JSON.stringify(jobId)},
+        status: "running",
+        phase: "running",
+        title: "Codex Task",
+        jobClass: "task",
+        summary: "Investigate flaky test",
+        logFile: ${JSON.stringify(logFile)},
+        createdAt: new Date().toISOString(),
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+      fs.writeFileSync(${JSON.stringify(logFile)}, "", "utf8");
+      fs.writeFileSync(${JSON.stringify(jobFile)}, JSON.stringify(job, null, 2) + "\\n", "utf8");
+      fs.writeFileSync(
+        ${JSON.stringify(stateFile)},
+        JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [job] }, null, 2) + "\\n",
+        "utf8"
+      );
+    }, ${appearDelayMs});
+  `;
+  const writer = spawn(process.execPath, ["-e", writerSource], { stdio: "ignore" });
+
+  try {
+    const startedAt = Date.now();
+    const result = run(
+      "node",
+      [SCRIPT, "wait", jobId, "--timeout-ms", String(totalTimeoutMs), "--poll-interval-ms", "100", "--cwd", workspace],
+      { cwd: workspace }
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.equal(result.status, 2, result.stderr);
+    assert.match(result.stdout, new RegExp(`${jobId} has not finished yet`));
+    // The old (finding-#1) behavior: appear-wait (~1.2s) THEN a fresh full
+    // active-status wait (~3s) => ~4.2s total. The unified-deadline behavior:
+    // the whole call is bounded by totalTimeoutMs (~3s), so it must finish
+    // well under appearDelayMs + totalTimeoutMs.
+    assert.ok(
+      elapsedMs < appearDelayMs + totalTimeoutMs - scaleTimeout(500),
+      `expected the call to respect ONE shared deadline (~${totalTimeoutMs}ms total), took ${elapsedMs}ms`
+    );
+  } finally {
+    writer.kill();
+  }
+});
+
+test("wait reports a cancelled background task with exit code 1", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const jobId = "task-cancelled";
+  const logFile = path.join(jobsDir, `${jobId}.log`);
+  const job = {
+    id: jobId,
+    status: "cancelled",
+    phase: "cancelled",
+    title: "Codex Task",
+    jobClass: "task",
+    summary: "Investigate flaky test",
+    logFile,
+    errorMessage: "Cancelled by user.",
+    createdAt: "2026-03-18T15:30:00.000Z",
+    startedAt: "2026-03-18T15:30:01.000Z",
+    completedAt: "2026-03-18T15:30:03.000Z",
+    cancelledAt: "2026-03-18T15:30:03.000Z"
+  };
+  fs.writeFileSync(logFile, "[2026-03-18T15:30:00.000Z] Starting Codex Task.\n", "utf8");
+  fs.writeFileSync(path.join(jobsDir, `${jobId}.json`), `${JSON.stringify(job, null, 2)}\n`, "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [job] }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "wait", jobId, "--cwd", workspace], { cwd: workspace });
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stdout, /Cancelled by user\./);
+
+  const resultJson = run("node", [SCRIPT, "wait", jobId, "--cwd", workspace, "--json"], { cwd: workspace });
+  assert.equal(resultJson.status, 1, resultJson.stderr);
+  const payload = JSON.parse(resultJson.stdout);
+  assert.equal(payload.job.status, "cancelled");
+});
+
+test("wait reports a meaningful reason for a failed job that never got its own errorMessage, not an empty result", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  const jobId = "task-failed-no-message";
+  const logFile = path.join(jobsDir, `${jobId}.log`);
+  // Deliberately no errorMessage on the job AND no storedJob.result/rendered —
+  // the shape a worker crash outside runTrackedJob's own catch could leave
+  // behind. renderStoredJobResult's fallback must still surface status and
+  // summary rather than printing nothing.
+  const job = {
+    id: jobId,
+    status: "failed",
+    phase: "failed",
+    title: "Codex Task",
+    jobClass: "task",
+    summary: "Investigate the flaky worker timeout",
+    logFile,
+    createdAt: "2026-03-18T15:30:00.000Z",
+    startedAt: "2026-03-18T15:30:01.000Z",
+    completedAt: "2026-03-18T15:30:03.000Z"
+  };
+  fs.writeFileSync(logFile, "[2026-03-18T15:30:00.000Z] Starting Codex Task.\n", "utf8");
+  fs.writeFileSync(path.join(jobsDir, `${jobId}.json`), `${JSON.stringify(job, null, 2)}\n`, "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [job] }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const result = run("node", [SCRIPT, "wait", jobId, "--cwd", workspace], { cwd: workspace });
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.notEqual(result.stdout.trim(), "");
+  assert.match(result.stdout, /Status: failed/);
+  assert.match(result.stdout, /Investigate the flaky worker timeout/);
 });

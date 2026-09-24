@@ -9,8 +9,9 @@ user-invocable: false
 ## A backgrounded run is not finished when the helper returns
 
 `codex:codex-rescue` launches the run with `--background` and returns
-immediately. Its stdout says `started in the background as <job-id>` and names
-the two commands that collect the answer. That text is a receipt: it is not the answer, and it is not a verdict about the answer.
+immediately. Its stdout says `started in the background as <job-id>` and has a
+line starting with `WAIT: ` naming the single command that collects the
+answer. That text is a receipt: it is not the answer, and it is not a verdict about the answer.
 
 - The notification that the subagent finished means the *forwarder* finished.
   The Codex turn is still running, and nothing else arrives on its own.

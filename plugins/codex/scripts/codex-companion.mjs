@@ -839,13 +839,18 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
 // — no separate poll-then-fetch round trip, and no window where a forwarder's
 // own completion (see codex-result-handling's "the subagent finished is not
 // the answer") gets mistaken for Codex's.
+// The `WAIT: ` prefix is a stable extraction marker, not decoration: a caller
+// parsing this text (codex:rescue's forwarding contract — see rescue.md) must
+// find the command by a fixed anchor, not by "the last non-empty line before
+// the blank line", which broke the moment an explanatory line was added after
+// it (code-review finding #3). `--json` callers don't need the marker at
+// all — `payload.waitCommand` is already the single unambiguous field there.
 function renderQueuedTaskLaunch(payload) {
   return [
     `${payload.title} started in the background as ${payload.jobId}.`,
     "This is NOT the answer: Codex is still working, and nothing further arrives on its own.",
-    "To collect it, run this command as a BACKGROUND tool call (e.g. Claude Code: Bash with run_in_background: true) — you get exactly one notification, and the answer is already in its stdout when it fires:",
-    `  ${payload.waitCommand}`,
-    "(it blocks until the job leaves queued/running, then prints the answer; raise --timeout-ms for a longer run.)",
+    "To collect it, run the WAIT command below as a BACKGROUND tool call (e.g. Claude Code: Bash with run_in_background: true) — you get exactly one notification, and the answer is already in its stdout when it fires. It blocks until the job leaves queued/running, then prints the answer; raise --timeout-ms for a longer run.",
+    `WAIT: ${payload.waitCommand}`,
     ""
   ].join("\n");
 }
@@ -1404,6 +1409,25 @@ function handleResult(argv) {
 // Exit codes: 0 completed, 1 failed/cancelled (stdout carries the reason), 2
 // still queued/running when --timeout-ms ran out (not an error — the job is
 // still alive, retry the same command).
+// Preserves exactly the flags the caller actually passed (plus --cwd, always
+// needed since a retry is a fresh process with no cwd to inherit). A retry
+// line that dropped the caller's own --timeout-ms/--json would silently hand
+// back the 30-minute default and plain text even when the caller asked for
+// neither — code-review finding #2 on the first cut of this command.
+function buildWaitRetryArgs(jobId, cwd, options) {
+  const args = ["wait", jobId, "--cwd", cwd];
+  if (options["timeout-ms"] != null) {
+    args.push("--timeout-ms", String(options["timeout-ms"]));
+  }
+  if (options["poll-interval-ms"] != null) {
+    args.push("--poll-interval-ms", String(options["poll-interval-ms"]));
+  }
+  if (options.json) {
+    args.push("--json");
+  }
+  return args;
+}
+
 async function handleWait(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
@@ -1418,19 +1442,38 @@ async function handleWait(argv) {
 
   const timeoutMs = Math.max(0, Number(options["timeout-ms"]) || BACKGROUND_COLLECT_TIMEOUT_MS);
   const pollIntervalMs = Math.max(100, Number(options["poll-interval-ms"]) || DEFAULT_STATUS_POLL_INTERVAL_MS);
+  // ONE deadline for the whole call, not two independent budgets stacked back
+  // to back — code-review finding #1: a caller passing a short --timeout-ms
+  // (say, to bound a retry loop of its own) must actually get bounded by it,
+  // including the time spent surviving the job-index race below. The index
+  // wait gets whichever is smaller: its own bounded default/override, or
+  // whatever is left of the caller's total budget.
+  const deadline = Date.now() + timeoutMs;
 
   // First, survive the job-index race (see waitForJobToAppear). Once the job
   // is actually known, waitForSingleJobSnapshot's own lookup will find it
   // every time, so reusing it here does not reintroduce that race.
-  const appeared = await waitForJobToAppear(cwd, reference, { pollIntervalMs });
-  const waited = isActiveJobStatus(appeared.job.status)
-    ? await waitForSingleJobSnapshot(cwd, reference, { timeoutMs, pollIntervalMs })
-    : { ...appeared, waitTimedOut: false, timeoutMs };
+  const indexRetryBudgetMs = Math.min(resolveWaitJobIndexRetryMs(), Math.max(0, deadline - Date.now()));
+  const appeared = await waitForJobToAppear(cwd, reference, { pollIntervalMs, retryBudgetMs: indexRetryBudgetMs });
+  const remainingMs = Math.max(0, deadline - Date.now());
+  let waited;
+  if (!isActiveJobStatus(appeared.job.status)) {
+    waited = { ...appeared, waitTimedOut: false, timeoutMs: remainingMs };
+  } else if (remainingMs <= 0) {
+    // waitForSingleJobSnapshot treats a falsy timeoutMs (0 included — `0 ||
+    // DEFAULT` is truthy in JS) as "use the 240s default", which would blow
+    // straight past the deadline this call just spent its whole budget
+    // reaching. An already-exhausted budget is a timeout outright, not a
+    // reason to poll once more.
+    waited = { ...appeared, waitTimedOut: true, timeoutMs: remainingMs };
+  } else {
+    waited = await waitForSingleJobSnapshot(cwd, reference, { timeoutMs: remainingMs, pollIntervalMs });
+  }
 
   const { workspaceRoot, job } = waited;
 
   if (isActiveJobStatus(job.status)) {
-    const retryCommand = buildCompanionCommand(["wait", job.id, "--cwd", cwd]);
+    const retryCommand = buildCompanionCommand(buildWaitRetryArgs(job.id, cwd, options));
     const message = `${job.id} has not finished yet (${job.status}). Retry: ${retryCommand}\n`;
     if (options.json) {
       outputResult({ status: "timeout", job, retryCommand }, true);

@@ -1502,7 +1502,11 @@ test("task --background hands the caller a runnable way to collect the answer", 
   // the ONE command that fetches it (previously two: `status --wait` then
   // `result`) — a slash command does not qualify, the caller cannot run one.
   assert.match(launched.stdout, /not the answer|still (running|working)/i);
-  assert.match(launched.stdout, new RegExp(`wait ${jobId} --cwd`));
+  // `WAIT: ` is a stable extraction marker (not "last non-empty line") so a
+  // caller can find the command regardless of what explanatory text sits
+  // around it — see rescue.md's parsing rule and codex-companion.mjs's
+  // renderQueuedTaskLaunch.
+  assert.match(launched.stdout, new RegExp(`^WAIT: .*wait ${jobId} --cwd`, "m"));
   // The command must be run as its own background tool call, not awaited
   // inline — otherwise it reproduces the same host Bash-tool timeout
   // `--background` exists to avoid.
