@@ -269,15 +269,29 @@ test("transfer, result, and cancel commands are exposed as deterministic runtime
 test("the contract tells the caller to collect a backgrounded rescue result", () => {
   const resultHandling = read("skills/codex-result-handling/SKILL.md");
   const rescueAgent = read("agents/codex-rescue.md");
+  const rescueCommand = read("commands/rescue.md");
 
   // The subagent finishing is not the Codex run finishing. Without this said
   // out loud, the caller reads the launch text as an empty answer and moves on
   // while the answer sits on disk waiting to be fetched.
   assert.match(resultHandling, /started in the background/i);
   assert.match(resultHandling, /is not the answer/i);
-  assert.match(resultHandling, /--wait/);
-  assert.match(resultHandling, /result <job-id>|`result`/i);
+  assert.match(resultHandling, /wait <job-id>/);
+  assert.match(resultHandling, /run_in_background:\s*true/);
   assert.match(rescueAgent, /verbatim|exactly as-is/i);
+
+  // 13.08.2026 regression: a subagent's own completion notification was
+  // indistinguishable from Codex's answer, because collecting a backgrounded
+  // run took two separate Bash calls (`status --wait` then `result`) that
+  // nothing forced the caller to actually issue. The fix is structural: the
+  // command itself launches the single `wait` command as its own background
+  // tool call right after the subagent returns, so exactly one notification
+  // carries the real answer.
+  assert.match(rescueCommand, /Collecting a backgrounded run/i);
+  assert.match(rescueCommand, /is not the Codex turn finishing/i);
+  assert.match(rescueCommand, /run that exact command yourself via `Bash\(\.\.\., run_in_background: true\)`/i);
+  assert.match(rescueCommand, /Do not run `wait` inline\/foreground/i);
+  assert.match(rescueCommand, /arrive as a notification/i);
 });
 
 test("internal docs use task terminology for rescue runs", () => {

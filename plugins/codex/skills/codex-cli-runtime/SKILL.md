@@ -11,6 +11,7 @@ Use this skill only inside the `codex:codex-rescue` subagent.
 Primary helpers:
 - `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" prompt-path --cwd <dir> --label rescue` — prints one line, an absolute path to a file that does not exist yet.
 - `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task --prompt-file "<path>" ...`
+- `--background` runs print a `wait <job-id> ...` command in their stdout — that is what collects the answer (blocks until the job leaves queued/running, then prints the result in one call); collecting it is the `/codex:rescue` command's job, run as its own background tool call, not something this subagent invokes.
 - `task --output-schema <path>` forwards a JSON Schema to Codex's structured output for that turn (and a resumed one), read once up front; `result --json`/`task --json` then carry the parsed answer as `structured` (`structuredError` and `structured: null` if Codex's answer did not come back as JSON at all). The companion only `JSON.parse`s the answer — it does not itself validate the parsed object against the schema. Conformance is enforced server-side by Codex's strict structured-output mode; a turn the server rejects for not conforming ends the run with a non-zero status, and `structuredError`/the job's `errorMessage` carry the server's own rejection text.
 
 Prompt delivery:

@@ -82,6 +82,24 @@ const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const BACKGROUND_COLLECT_TIMEOUT_MS = 1800000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const TASK_WORKER_RECORD_WAIT_TIMEOUT_MS = 1000;
+// `wait` is called immediately after `task --background` returns, often in
+// the very same tool-call sequence. The detached worker (spawnDetachedTaskWorker)
+// takes its own moment to start and write the job's first index entry, so the
+// job id `task --background` just printed can still be unknown to `wait`'s
+// very first lookup even though the launch itself succeeded. Retry only the
+// specific "No job found" miss, bounded, rather than either failing outright
+// (case seen live 23.09.2026: `wait` right after `task --background` returned
+// "No job found" once before the index caught up) or looping forever on a
+// job id that was simply wrong.
+const WAIT_JOB_INDEX_RETRY_MS = 15000;
+const NO_JOB_FOUND_MESSAGE_PATTERN = /^No job found for /;
+// Overridable so tests exercising "the job id genuinely does not exist" (the
+// SAME error message, but no worker ever coming) do not have to burn the full
+// 15s default to see it fail.
+function resolveWaitJobIndexRetryMs(env = process.env) {
+  const fromEnv = Number(env.CODEX_COMPANION_WAIT_INDEX_RETRY_MS);
+  return Number.isFinite(fromEnv) && fromEnv >= 0 ? fromEnv : WAIT_JOB_INDEX_RETRY_MS;
+}
 // Foreground runs are invoked by Claude Code's Bash tool, which SIGKILLs node
 // at its own timeout (default 120000ms) and returns nothing. Set the runtime
 // turn budget just below that so a stalled foreground turn fails fast with a
@@ -165,6 +183,8 @@ function printUsage() {
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
+      "  node scripts/codex-companion.mjs wait <job-id> [--timeout-ms N] [--cwd <dir>] [--json]",
+      "    Blocks until the job leaves queued/running, then prints its result (same as `status --wait` + `result`, in one call). Run this as a BACKGROUND tool call so the host delivers one notification with the answer. Exit codes: 0 completed, 1 failed/cancelled, 2 still running (--timeout-ms ran out; retry the same command).",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
     ].join("\n")
   );
@@ -451,6 +471,29 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
     waitTimedOut: isActiveJobStatus(snapshot.job.status),
     timeoutMs
   };
+}
+
+// See WAIT_JOB_INDEX_RETRY_MS above for why this retries on that one specific
+// error message rather than any lookup failure. A reference that genuinely
+// does not resolve to a job (typo, wrong workspace) keeps throwing past the
+// retry budget and surfaces the same "No job found" error `status`/`result`
+// already give.
+async function waitForJobToAppear(cwd, reference, options = {}) {
+  const retryBudgetMs = Math.max(0, Number(options.retryBudgetMs) || resolveWaitJobIndexRetryMs());
+  const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
+  const deadline = Date.now() + retryBudgetMs;
+
+  for (;;) {
+    try {
+      return buildSingleJobSnapshot(cwd, reference);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!NO_JOB_FOUND_MESSAGE_PATTERN.test(message) || Date.now() >= deadline) {
+        throw error;
+      }
+      await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
+    }
+  }
 }
 
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
@@ -786,17 +829,23 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
 // fetch results, or follow up. "Started in the background" alone therefore
 // reads exactly like an empty answer, and that is how finished runs were left
 // uncollected. So the launch has to say the answer is not here yet and carry
-// the two commands that fetch it. A slash command will not do — those are for
-// the human; the caller cannot invoke one.
+// the one command that fetches it.
+//
+// That command must be run as its OWN background tool call (Claude Code:
+// `Bash` with `run_in_background: true`), not awaited inline — inline it just
+// reproduces the same host Bash-tool timeout `task --background` was started
+// to avoid. Run in the background, the host delivers exactly one notification
+// when `wait` exits, and the answer is already sitting in that call's stdout
+// — no separate poll-then-fetch round trip, and no window where a forwarder's
+// own completion (see codex-result-handling's "the subagent finished is not
+// the answer") gets mistaken for Codex's.
 function renderQueuedTaskLaunch(payload) {
   return [
     `${payload.title} started in the background as ${payload.jobId}.`,
     "This is NOT the answer: Codex is still working, and nothing further arrives on its own.",
-    "To collect it, block until the run finishes:",
+    "To collect it, run this command as a BACKGROUND tool call (e.g. Claude Code: Bash with run_in_background: true) — you get exactly one notification, and the answer is already in its stdout when it fires:",
     `  ${payload.waitCommand}`,
-    "then read the answer:",
-    `  ${payload.resultCommand}`,
-    "(--wait polls until the job leaves queued/running; raise --timeout-ms for a longer run.)",
+    "(it blocks until the job leaves queued/running, then prints the answer; raise --timeout-ms for a longer run.)",
     ""
   ].join("\n");
 }
@@ -1036,16 +1085,7 @@ function enqueueBackgroundTask(cwd, job, request) {
       title: job.title,
       summary: job.summary,
       logFile,
-      waitCommand: buildCompanionCommand([
-        "status",
-        job.id,
-        "--wait",
-        "--timeout-ms",
-        String(BACKGROUND_COLLECT_TIMEOUT_MS),
-        "--cwd",
-        cwd
-      ]),
-      resultCommand: buildCompanionCommand(["result", job.id, "--cwd", cwd])
+      waitCommand: buildCompanionCommand(["wait", job.id, "--cwd", cwd])
     },
     logFile
   };
@@ -1348,6 +1388,65 @@ function handleResult(argv) {
   };
 
   outputCommandResult(payload, renderStoredJobResult(job, storedJob), options.json);
+}
+
+// Collapses `status <id> --wait` + `result <id>` into one call the caller can
+// hand straight to a BACKGROUND tool call (Claude Code: `Bash` with
+// `run_in_background: true`): the host delivers exactly one notification when
+// that call exits, and by then the answer is already in this command's
+// stdout. Splitting collection across two Bash calls (the previous contract)
+// meant a forwarding subagent's launch text was the only thing the calling
+// agent ever saw — see renderQueuedTaskLaunch — and "the subagent finished"
+// was indistinguishable from "Codex answered". See job-control.mjs for the
+// reconcile (dead worker / broker restart -> failed) that `wait` inherits for
+// free through buildSingleJobSnapshot/listJobs, same as `status --wait`.
+//
+// Exit codes: 0 completed, 1 failed/cancelled (stdout carries the reason), 2
+// still queued/running when --timeout-ms ran out (not an error — the job is
+// still alive, retry the same command).
+async function handleWait(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
+    booleanOptions: ["json"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const reference = positionals[0] ?? "";
+  if (!reference) {
+    throw new Error("`wait` requires a job id.");
+  }
+
+  const timeoutMs = Math.max(0, Number(options["timeout-ms"]) || BACKGROUND_COLLECT_TIMEOUT_MS);
+  const pollIntervalMs = Math.max(100, Number(options["poll-interval-ms"]) || DEFAULT_STATUS_POLL_INTERVAL_MS);
+
+  // First, survive the job-index race (see waitForJobToAppear). Once the job
+  // is actually known, waitForSingleJobSnapshot's own lookup will find it
+  // every time, so reusing it here does not reintroduce that race.
+  const appeared = await waitForJobToAppear(cwd, reference, { pollIntervalMs });
+  const waited = isActiveJobStatus(appeared.job.status)
+    ? await waitForSingleJobSnapshot(cwd, reference, { timeoutMs, pollIntervalMs })
+    : { ...appeared, waitTimedOut: false, timeoutMs };
+
+  const { workspaceRoot, job } = waited;
+
+  if (isActiveJobStatus(job.status)) {
+    const retryCommand = buildCompanionCommand(["wait", job.id, "--cwd", cwd]);
+    const message = `${job.id} has not finished yet (${job.status}). Retry: ${retryCommand}\n`;
+    if (options.json) {
+      outputResult({ status: "timeout", job, retryCommand }, true);
+    } else {
+      process.stdout.write(message);
+    }
+    process.exitCode = 2;
+    return;
+  }
+
+  const storedJob = readStoredJob(workspaceRoot, job.id);
+  const payload = { job, storedJob };
+  outputCommandResult(payload, renderStoredJobResult(job, storedJob), options.json);
+  if (job.status !== "completed") {
+    process.exitCode = 1;
+  }
 }
 
 // Prompt files older than this are swept whenever we touch the directory
@@ -1865,6 +1964,9 @@ async function main() {
       break;
     case "result":
       handleResult(argv);
+      break;
+    case "wait":
+      await handleWait(argv);
       break;
     case "task-resume-candidate":
       handleTaskResumeCandidate(argv);

@@ -16,12 +16,18 @@ the two commands that collect the answer. That text is a receipt: it is not the 
   The Codex turn is still running, and nothing else arrives on its own.
 - Never present that receipt to the user as Codex's answer, and never read it
   as "Codex found nothing" or "Codex stayed silent". It says neither.
-- Collect the answer yourself with the commands printed in the receipt: run the
-  `status <job-id> --wait ...` command to block until the run leaves
-  queued/running, then the `result <job-id> ...` command to read it. If the
-  wait times out, the run is still going — wait again with a larger
-  `--timeout-ms`, do not conclude anything from the timeout.
-- Only after `result` returns do the presentation rules below apply.
+- Collect the answer yourself with the single `wait <job-id> ...` command
+  printed in the receipt, run as its OWN background tool call (Claude Code:
+  `Bash` with `run_in_background: true`) — not awaited inline, which would
+  just reproduce the timeout `--background` was started to avoid. The host
+  delivers exactly one notification when that call exits, and its stdout is
+  already the collected answer at that point: no separate poll-then-fetch step.
+- Exit code 2 means `--timeout-ms` ran out while the job was still
+  queued/running — not a failure. Rerun the exact `wait <job-id> ...` command
+  it prints (again as a background tool call) and do not conclude anything
+  from the timeout itself.
+- Only after a `wait` call returns exit code 0 or 1 do the presentation rules
+  below apply.
 - Tell the user the run is in flight before you start waiting, so a long Codex
   turn does not look like a hang.
 

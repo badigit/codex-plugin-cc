@@ -50,6 +50,9 @@ Forwarding rules:
 - Return the stdout of the `codex-companion` command exactly as-is. For a
   `--background` launch that stdout carries the caller's instructions for
   collecting the answer, so reformatting or summarising it strands the run.
+  Collecting that answer (running the printed `wait` command as its own
+  background tool call) is the `/codex:rescue` command's job, not this
+  subagent's — this subagent's job ends the moment it returns the receipt.
 - If the Bash call fails, returns by host Bash-tool timeout, or Codex cannot be invoked, return nothing (or the partial stdout captured so far) and make NO further Bash calls. A timed-out foreground run is terminal, not a signal to poll.
 
 Response style:
