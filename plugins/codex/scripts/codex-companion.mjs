@@ -96,6 +96,17 @@ const NO_JOB_FOUND_MESSAGE_PATTERN = /^No job found for /;
 // Overridable so tests exercising "the job id genuinely does not exist" (the
 // SAME error message, but no worker ever coming) do not have to burn the full
 // 15s default to see it fail.
+// `Number(x) || fallback` treats an explicit 0 as "unset": `--timeout-ms 0`
+// then waited the full default instead of giving up at once. Only a missing
+// or non-numeric value falls back; negatives clamp to 0.
+function resolveExplicitTimeoutMs(value, fallbackMs) {
+  if (value == null || value === "") {
+    return fallbackMs;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.max(0, parsed) : fallbackMs;
+}
+
 function resolveWaitJobIndexRetryMs(env = process.env) {
   const fromEnv = Number(env.CODEX_COMPANION_WAIT_INDEX_RETRY_MS);
   return Number.isFinite(fromEnv) && fromEnv >= 0 ? fromEnv : WAIT_JOB_INDEX_RETRY_MS;
@@ -456,7 +467,7 @@ function findLatestResumableTaskJob(jobs, options = {}) {
 }
 
 async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
-  const timeoutMs = Math.max(0, Number(options.timeoutMs) || DEFAULT_STATUS_WAIT_TIMEOUT_MS);
+  const timeoutMs = resolveExplicitTimeoutMs(options.timeoutMs, DEFAULT_STATUS_WAIT_TIMEOUT_MS);
   const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
   const deadline = Date.now() + timeoutMs;
   let snapshot = buildSingleJobSnapshot(cwd, reference);
@@ -479,7 +490,13 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
 // retry budget and surfaces the same "No job found" error `status`/`result`
 // already give.
 async function waitForJobToAppear(cwd, reference, options = {}) {
-  const retryBudgetMs = Math.max(0, Number(options.retryBudgetMs) || resolveWaitJobIndexRetryMs());
+  // An explicit 0 means "no budget left" (caller's deadline already spent) and
+  // must not fall back to the default 15s: only a missing value does.
+  const requestedBudgetMs = Number(options.retryBudgetMs);
+  const retryBudgetMs = Math.max(
+    0,
+    options.retryBudgetMs == null || !Number.isFinite(requestedBudgetMs) ? resolveWaitJobIndexRetryMs() : requestedBudgetMs
+  );
   const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
   const deadline = Date.now() + retryBudgetMs;
 
@@ -1440,7 +1457,7 @@ async function handleWait(argv) {
     throw new Error("`wait` requires a job id.");
   }
 
-  const timeoutMs = Math.max(0, Number(options["timeout-ms"]) || BACKGROUND_COLLECT_TIMEOUT_MS);
+  const timeoutMs = resolveExplicitTimeoutMs(options["timeout-ms"], BACKGROUND_COLLECT_TIMEOUT_MS);
   const pollIntervalMs = Math.max(100, Number(options["poll-interval-ms"]) || DEFAULT_STATUS_POLL_INTERVAL_MS);
   // ONE deadline for the whole call, not two independent budgets stacked back
   // to back — code-review finding #1: a caller passing a short --timeout-ms

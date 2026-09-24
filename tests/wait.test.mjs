@@ -302,6 +302,25 @@ test("wait's --timeout-ms bounds the WHOLE call, including the job-index-appear 
   );
 });
 
+// Second review round: an explicit zero budget (`--timeout-ms 0`, or a
+// negative value normalized to 0) was treated as "unset" by `x || default`
+// and silently became the 15s index-retry default.
+test("wait with a zero --timeout-ms does not fall back to the 15s index-retry default", () => {
+  const workspace = makeTempDir();
+
+  const startedAt = Date.now();
+  const result = run(
+    "node",
+    [SCRIPT, "wait", "typo-job-id", "--timeout-ms", "0", "--cwd", workspace],
+    { cwd: workspace }
+  );
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /No job found for "typo-job-id"/);
+  assert.ok(elapsedMs < 6000, `expected an immediate give-up for --timeout-ms 0, took ${elapsedMs}ms`);
+});
+
 test("a job that appears mid-wait is only waited for the REMAINDER of --timeout-ms, not a fresh full budget", async () => {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
