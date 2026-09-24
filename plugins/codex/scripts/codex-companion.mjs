@@ -1064,11 +1064,19 @@ async function runForegroundCommand(job, runner, options = {}) {
 }
 
 // Quote only what needs it: the caller pastes this straight into a shell.
+// The printed command is meant to be pasted verbatim into a shell tool — on
+// Windows that is usually Git Bash, where an unquoted `C:\Users\...` loses
+// every backslash (`\U` -> `U`) and the command silently points nowhere.
+// Forward slashes are understood by node, bash, PowerShell and cmd alike, so
+// Windows paths are printed with them instead of relying on quoting.
+function formatCommandPart(part, platform = process.platform) {
+  const text = platform === "win32" ? String(part).replace(/\\/g, "/") : String(part);
+  return /[\s"']/.test(text) ? `"${text.replace(/"/g, '\\"')}"` : text;
+}
+
 function buildCompanionCommand(args) {
   const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
-  return ["node", scriptPath, ...args]
-    .map((part) => (/[\s"']/.test(part) ? `"${part.replace(/"/g, '\\"')}"` : part))
-    .join(" ");
+  return ["node", scriptPath, ...args].map((part) => formatCommandPart(part)).join(" ");
 }
 
 function spawnDetachedTaskWorker(cwd, jobId) {

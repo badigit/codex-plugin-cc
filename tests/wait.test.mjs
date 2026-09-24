@@ -27,7 +27,8 @@ function initRepoWithCommit(repo) {
 // preserved verbatim in the retry line, and a substring match would not catch
 // them silently going missing.
 function quoteArg(part) {
-  return /[\s"']/.test(part) ? `"${part.replace(/"/g, '\\"')}"` : part;
+  const text = process.platform === "win32" ? String(part).replace(/\\/g, "/") : String(part);
+  return /[\s"']/.test(text) ? `"${text.replace(/"/g, '\\"')}"` : text;
 }
 function expectedWaitCommand(args) {
   return ["node", SCRIPT, ...args].map(quoteArg).join(" ");

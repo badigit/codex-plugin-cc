@@ -1527,6 +1527,9 @@ ${launched.stdout}`
   assert.equal(payload.status, "queued");
   assert.match(payload.waitCommand, new RegExp(`wait ${payload.jobId} --cwd`));
   assert.equal(payload.resultCommand, undefined);
+  // The command is pasted verbatim into a shell tool (Git Bash on Windows),
+  // where unquoted backslashes are eaten: `C:\Users` becomes `C:Users`.
+  assert.doesNotMatch(payload.waitCommand, /\\/, "waitCommand must not carry backslashes into a shell");
 });
 
 test("task --background preserves --read-only through the detached worker", async () => {
