@@ -1025,7 +1025,7 @@ async function requestExternalAgentSessionImport(client, params) {
 async function startThread(client, cwd, options = {}) {
   const response = await client.request("thread/start", buildThreadParams(cwd, options));
   const threadId = response.thread.id;
-  if (options.threadName) {
+  if (options.threadName && options.ephemeral === false) {
     try {
       await client.request("thread/name/set", { threadId, name: options.threadName });
     } catch (err) {
@@ -1447,15 +1447,8 @@ export async function runAppServerReview(cwd, options = {}) {
       message: "",
       brokerEndpoint: client.transport === "broker" ? client.endpoint : null
     });
-    // Ревью — такой же делегированный прогон, как задача, и его тред обязан
-    // исчезать из списка сессий Codex ровно так же. Архивацию в fork.10
-    // получил только runAppServerTurn, и этот путь остался видимым: 107 тредов
-    // «Codex Review» в state_5.sqlite с archived=0 против нуля у task/rescue.
-    //
-    // Тредов тут ДВА: свой (thread/start) и тот, что заводит сам review/start
-    // (reviewThreadId). Второй в список попадает так же, поэтому набор ведётся
-    // рядом с captureTurn, а не берётся из turnState: при броске хода
-    // turnState не существует, а треды уже есть.
+    // One-shot reviews use an ephemeral source. A separate detached review
+    // thread, if the server creates one, still needs best-effort archiving.
     const ownedThreadIds = new Set();
     try {
     await validateExplicitReasoningSelection(client, cwd, options);
@@ -1464,11 +1457,13 @@ export async function runAppServerReview(cwd, options = {}) {
       model: options.model,
       effort: options.effort,
       sandbox: "read-only",
-      ephemeral: false,
+      // Experiment: one-shot reviews must not enter the desktop session store.
+      ephemeral: true,
       threadName: options.threadName ?? buildReviewThreadName(options.target?.label)
     });
     const sourceThreadId = response.thread.id;
-    ownedThreadIds.add(sourceThreadId);
+    // Only a separate detached review thread may need archiving; the source
+    // is ephemeral and has no rollout to archive.
     const resolved = {
       model: response.model,
       modelProvider: response.modelProvider,
@@ -1503,7 +1498,9 @@ export async function runAppServerReview(cwd, options = {}) {
         onResponse(response, state) {
           if (response.reviewThreadId) {
             state.threadIds.add(response.reviewThreadId);
-            ownedThreadIds.add(response.reviewThreadId);
+            if (response.reviewThreadId !== sourceThreadId) {
+              ownedThreadIds.add(response.reviewThreadId);
+            }
             if (delivery === "detached") {
               state.threadId = response.reviewThreadId;
             }

@@ -76,6 +76,14 @@ One simple first run is:
 
 ### `/codex:review`
 
+**Local experiment (2026-09-25):** native reviews, adversarial reviews and new
+`task --label review` runs use ephemeral Codex threads by default. Job results
+remain available through companion `result`, but these threads cannot be resumed
+after the server unloads them. Ordinary task/rescue runs and explicit resumes of
+existing threads keep their persistence. Roll back by restoring the `dim` versions
+of `scripts/codex-companion.mjs`, `scripts/lib/codex.mjs`,
+`scripts/lib/render.mjs` and `scripts/lib/tracked-jobs.mjs` in the installed plugin.
+
 Runs a normal Codex review on your current work. It gives you the same quality of code review as running `/review` inside Codex directly.
 
 > [!NOTE]

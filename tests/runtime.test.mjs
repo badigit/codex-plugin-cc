@@ -183,7 +183,7 @@ test("review renders a no-findings result from app-server review/start", () => {
   assert.equal(fakeState.lastThreadStart.sandbox, "read-only");
 });
 
-test("review starts a persistent (non-ephemeral) thread so a rollout file is written", () => {
+test("review starts an ephemeral thread without an archive attempt", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -202,10 +202,11 @@ test("review starts a persistent (non-ephemeral) thread so a rollout file is wri
   assert.equal(result.status, 0, result.stderr);
   const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
   assert.equal(state.threads.length, 1);
-  assert.equal(state.threads[0].ephemeral, false);
+  assert.equal(state.threads[0].ephemeral, true);
+  assert.notEqual(state.threads[0].archived, true);
 });
 
-test("adversarial review starts a persistent (non-ephemeral) thread so a rollout file is written", () => {
+test("adversarial review starts an ephemeral thread without an archive attempt", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
   installFakeCodex(binDir);
@@ -224,8 +225,31 @@ test("adversarial review starts a persistent (non-ephemeral) thread so a rollout
   assert.equal(result.status, 0, result.stderr);
   const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
   assert.equal(state.threads.length, 1);
-  assert.equal(state.threads[0].ephemeral, false);
+  assert.equal(state.threads[0].ephemeral, true);
+  assert.notEqual(state.threads[0].archived, true);
 });
+
+for (const label of ["review", "task", "rescue"]) {
+  test(`task label ${label} uses the intended persistence`, { timeout: 30000 }, () => {
+    const repo = makeTempDir();
+    const binDir = makeTempDir();
+    installFakeCodex(binDir);
+    initGitRepo(repo);
+    const result = run("node", [SCRIPT, "task", "--label", label, "Check the code"], {
+      cwd: repo,
+      env: buildEnv(binDir)
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+    assert.equal(state.threads.length, 1);
+    assert.equal(state.threads[0].ephemeral, label === "review");
+    assert.equal(state.threads[0].archived === true, label !== "review");
+    assert.ok(readPersistedJob(repo).result, "the review result must survive without a session");
+    const output = run("node", [SCRIPT, "result"], { cwd: repo, env: buildEnv(binDir) });
+    assert.equal(output.status, 0, output.stderr);
+    assert.equal(output.stdout.includes("Resume in Codex:"), label !== "review");
+  });
+}
 
 test("task runs when the active provider does not require OpenAI login", () => {
   const repo = makeTempDir();
@@ -4552,7 +4576,7 @@ test("ревью тоже уходит из списка сессий", () => {
     // Про неудачу архивации companion пишет строкой "Could not archive thread"
     // — без неё падение этого теста выглядит как «archived undefined» и
     // разгадывается заново.
-    assert.equal(thread.archived, true, `тред ${thread.id} остался в списке сессий\n${result.stdout}\n${result.stderr}`);
+    assert.ok(thread.ephemeral || thread.archived, `тред ${thread.id} остался в списке сессий\n${result.stdout}\n${result.stderr}`);
   }
 });
 

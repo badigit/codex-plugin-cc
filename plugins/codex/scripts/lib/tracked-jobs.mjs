@@ -228,6 +228,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       phase: completionStatus === "completed" ? "done" : "failed",
       completedAt,
       result: execution.payload,
+      ephemeral: execution.payload?.ephemeral === true,
       rendered: execution.rendered,
       ...executionErrorMessage
     });
@@ -238,6 +239,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       turnId: execution.turnId ?? null,
       resolved: execution.resolved ?? null,
       summary: execution.summary,
+      ephemeral: execution.payload?.ephemeral === true,
       phase: completionStatus === "completed" ? "done" : "failed",
       pid: null,
       ...executionErrorMessage,

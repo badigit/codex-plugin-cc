@@ -556,6 +556,7 @@ async function executeReviewRun(request) {
     });
     const payload = {
       review: reviewName,
+      ephemeral: true,
       target,
       threadId: result.threadId,
       sourceThreadId: result.sourceThreadId,
@@ -599,7 +600,7 @@ async function executeReviewRun(request) {
     sandbox: "read-only",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
     onProgress: request.onProgress,
-    persistThread: true,
+    persistThread: false,
     turnTimeoutMs: request.turnTimeoutMs,
     hardCeilingMs: request.hardCeilingMs,
     threadName: `Codex Review: ${context.target.label}`.slice(0, 80)
@@ -610,6 +611,7 @@ async function executeReviewRun(request) {
   });
   const payload = {
     review: reviewName,
+    ephemeral: true,
     target,
     threadId: result.threadId,
     context: {
@@ -747,7 +749,9 @@ async function executeTaskRun(request) {
       assertThreadStartHonored,
       outputSchema: request.outputSchema ?? null,
       onProgress: request.onProgress,
-      persistThread: true,
+      // Existing threads remain resumable; only new review-labelled tasks
+      // participate in the ephemeral-review experiment.
+      persistThread: Boolean(resumeThreadId) || request.label !== "review",
       turnTimeoutMs: request.turnTimeoutMs,
       hardCeilingMs: request.hardCeilingMs,
       threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT, request.label)
@@ -772,6 +776,7 @@ async function executeTaskRun(request) {
   );
   const payload = {
     status: result.status,
+    ephemeral: !resumeThreadId && request.label === "review",
     threadId: result.threadId,
     rawOutput,
     touchedFiles: result.touchedFiles,

@@ -437,6 +437,9 @@ rl.on("line", (line) => {
 
       case "thread/name/set": {
         const thread = ensureThread(state, message.params.threadId);
+        if (thread.ephemeral) {
+          throw new Error("ephemeral thread does not support metadata updates");
+        }
         thread.name = message.params.name;
         thread.updatedAt = now();
         saveState(state);
