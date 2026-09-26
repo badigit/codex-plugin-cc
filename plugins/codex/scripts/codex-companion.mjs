@@ -176,7 +176,8 @@ function buildScratchSandboxPreamble(repoAbsPath) {
     `The current directory is a scratch sandbox, not the repository. ` +
     `The repository is available read-only at ${repoAbsPath} — run \`cd ${repoAbsPath}\` first to inspect it or run commands (including tests) against it. ` +
     `Write any temporary files, test artifacts, or command output only in the current directory (the scratch sandbox). ` +
-    `Do not attempt to modify anything inside the repository; those writes will be denied.`
+    `Do not attempt to modify anything inside the repository; those writes will be denied. ` +
+    `Before you finish, delete the temporary directories you created here (for example pytest's basetemp): on Windows, directories created with owner-only permissions (Python's os.mkdir(mode=0o700), which pytest uses) cannot be removed by anyone but you once this turn ends.`
   );
 }
 
@@ -723,7 +724,9 @@ async function executeTaskRun(request) {
 
   try {
     if (request.scratchSandbox) {
-      const scratchDir = resetScratchSandboxDir(workspaceRoot);
+      const scratchDir = resetScratchSandboxDir(workspaceRoot, {
+        warn: (message) => (request.onProgress ? request.onProgress(message) : process.stderr.write(`Warning: ${message}\n`))
+      });
       runCwd = scratchDir;
       envOverrides = { TEMP: scratchDir, TMP: scratchDir };
       writableRoots = [scratchDir];

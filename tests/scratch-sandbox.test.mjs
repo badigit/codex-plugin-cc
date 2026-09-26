@@ -148,6 +148,98 @@ test("resetScratchSandboxDir creates the scratch directory and clears leftovers 
   assert.deepEqual(fs.readdirSync(dir), []);
 });
 
+// Emulates the 26.09.2026 incident: a directory the Codex sandbox user left in
+// scratch (pytest basetemp, owner-only DACL) makes rmSync throw EPERM for the
+// host user. `fs` is the same mutable module object state.mjs imports, so
+// swapping `fs.rmSync` here is what state.mjs sees.
+function withUndeletable(predicate, fn) {
+  const realRmSync = fs.rmSync;
+  fs.rmSync = (target, options) => {
+    if (predicate(String(target))) {
+      const error = new Error(`EPERM, Permission denied: ${target}`);
+      error.code = "EPERM";
+      throw error;
+    }
+    return realRmSync(target, options);
+  };
+  try {
+    return fn();
+  } finally {
+    fs.rmSync = realRmSync;
+  }
+}
+
+test("resetScratchSandboxDir does not fail the job on an undeletable leftover: scratch is parked in scratch-trash and recreated empty", () => {
+  const repo = makeTempDir();
+  const dir = resetScratchSandboxDir(repo);
+  fs.mkdirSync(path.join(dir, "pytest-temp2"));
+  fs.writeFileSync(path.join(dir, "pytest-temp2", "conftest.pyc"), "x");
+  fs.writeFileSync(path.join(dir, "deletable.txt"), "x");
+  const trashDir = path.join(resolveStateDir(repo), "scratch-trash");
+
+  const warnings = [];
+  const result = withUndeletable(
+    (target) => path.basename(target) === "pytest-temp2",
+    () => resetScratchSandboxDir(repo, { warn: (message) => warnings.push(message) })
+  );
+
+  assert.equal(result, dir);
+  assert.deepEqual(fs.readdirSync(dir), []);
+  const parked = fs.readdirSync(trashDir);
+  assert.equal(parked.length, 1);
+  assert.equal(fs.existsSync(path.join(trashDir, parked[0], "pytest-temp2", "conftest.pyc")), true);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /could not remove pytest-temp2 \(EPERM\)/);
+  assert.match(warnings[0], /scratch-trash/);
+
+  // Next run: the parked directory is deletable again (in the real case, after
+  // an administrator took ownership) — the trash is collected silently.
+  const quiet = [];
+  resetScratchSandboxDir(repo, { warn: (message) => quiet.push(message) });
+  assert.deepEqual(fs.readdirSync(trashDir), []);
+  assert.deepEqual(quiet, []);
+});
+
+test("resetScratchSandboxDir reports, but does not throw on, parked scratch that stays undeletable", () => {
+  const repo = makeTempDir();
+  const dir = resetScratchSandboxDir(repo);
+  fs.mkdirSync(path.join(dir, "pytest-temp"));
+  const stuck = (target) => path.basename(target) === "pytest-temp" || path.dirname(target).endsWith("scratch-trash");
+  withUndeletable(stuck, () => resetScratchSandboxDir(repo));
+
+  const warnings = [];
+  withUndeletable(stuck, () => resetScratchSandboxDir(repo, { warn: (message) => warnings.push(message) }));
+  assert.deepEqual(fs.readdirSync(dir), []);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /1 parked scratch directory .* still cannot be deleted/);
+  assert.match(warnings[0], /takeown/);
+});
+
+test("resetScratchSandboxDir starts with the leftovers in place when scratch cannot be moved aside either", () => {
+  const repo = makeTempDir();
+  const dir = resetScratchSandboxDir(repo);
+  fs.mkdirSync(path.join(dir, "held-open"));
+  const realRenameSync = fs.renameSync;
+  fs.renameSync = () => {
+    const error = new Error("EBUSY: resource busy or locked");
+    error.code = "EBUSY";
+    throw error;
+  };
+  const warnings = [];
+  try {
+    const result = withUndeletable(
+      (target) => path.basename(target) === "held-open",
+      () => resetScratchSandboxDir(repo, { warn: (message) => warnings.push(message) })
+    );
+    assert.equal(result, dir);
+  } finally {
+    fs.renameSync = realRenameSync;
+  }
+  assert.deepEqual(fs.readdirSync(dir), ["held-open"]);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /could not move the directory aside \(EBUSY\)/);
+});
+
 test("resetScratchSandboxDir refuses when the repository IS the state directory's root (CLAUDE_PLUGIN_DATA misconfigured inside the repo)", () => {
   const repo = makeTempDir();
   const previous = process.env.CLAUDE_PLUGIN_DATA;

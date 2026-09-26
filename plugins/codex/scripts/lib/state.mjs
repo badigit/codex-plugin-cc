@@ -22,6 +22,7 @@ const MAX_JOBS = 50;
 // one-shot temp dir per invocation would grow that ACL by one entry every
 // run; reusing the same path lets Codex reuse the SID it already granted.
 const SCRATCH_SANDBOX_DIR_NAME = "scratch";
+const SCRATCH_SANDBOX_TRASH_DIR_NAME = "scratch-trash";
 const SCRATCH_SANDBOX_LOCK_FILE_NAME = "scratch.lock";
 export const DEFAULT_SCRATCH_SANDBOX_LOCK_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_SCRATCH_SANDBOX_LOCK_POLL_INTERVAL_MS = 2000;
@@ -230,17 +231,95 @@ function assertScratchDirIsSafeToTouch(stateDir, scratchDir, repoCwd) {
 //     MISCONFIGURATION (a data root that resolves through a junction) and
 //     against the sandboxed Codex process, not against an unsandboxed
 //     co-resident process racing the filesystem.
-export function resetScratchSandboxDir(cwd) {
+//
+// UNDELETABLE LEFTOVERS. On Windows the sandboxed turn runs as a separate
+// local user (CodexSandboxOffline), and Python >= 3.13 turns
+// `os.mkdir(path, 0o700)` — which is how pytest creates its basetemp — into
+// a PROTECTED DACL of SYSTEM, Administrators and CREATOR OWNER only. Such a
+// directory inherits nothing from scratch, its owner is the sandbox user,
+// and the host user can neither delete it nor even rename it inside scratch
+// (both EPERM, verified on a real leftover `scratch/pytest-temp2`). What the
+// host user CAN do is rename the scratch directory itself — scratch's own
+// ACL, inherited from the state dir, still grants it full control. So a
+// leftover that will not go away must not fail the whole job: the entire
+// scratch directory is moved aside to `scratch-trash/<timestamp>` and a
+// fresh one is created. That costs Codex one new writable-root SID on this
+// rare path (see SCRATCH_SANDBOX_DIR_NAME), which is the lesser evil
+// compared to a job that cannot start at all. Old trash is garbage-collected
+// best effort on every call; what stays undeletable is reported via `warn`
+// together with the command that clears it as an administrator.
+export function resetScratchSandboxDir(cwd, { warn = null } = {}) {
   const stateDir = resolveStateDir(cwd);
   const dir = resolveScratchSandboxDir(cwd);
+  const trashDir = path.join(stateDir, SCRATCH_SANDBOX_TRASH_DIR_NAME);
+  const report = (message) => warn?.(message);
   assertScratchDirIsSafeToTouch(stateDir, dir, cwd);
   fs.mkdirSync(dir, { recursive: true });
 
+  collectScratchTrash(stateDir, trashDir, cwd, report);
+
   assertScratchDirIsSafeToTouch(stateDir, dir, cwd);
+  const stuck = [];
   for (const entry of fs.readdirSync(dir)) {
-    fs.rmSync(path.join(dir, entry), { recursive: true, force: true });
+    try {
+      fs.rmSync(path.join(dir, entry), { recursive: true, force: true });
+    } catch (error) {
+      stuck.push({ entry, code: error?.code ?? "unknown error" });
+    }
   }
+  if (stuck.length === 0) {
+    return dir;
+  }
+
+  const stuckList = stuck.map(({ entry, code }) => `${entry} (${code})`).join(", ");
+  assertPathIsPlainDescendant(stateDir, trashDir);
+  const parked = path.join(trashDir, `${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}`);
+  try {
+    fs.mkdirSync(trashDir, { recursive: true });
+    fs.renameSync(dir, parked);
+    fs.mkdirSync(dir);
+  } catch (error) {
+    // Could not move scratch aside either (e.g. a still-running process
+    // from the previous turn holds a handle inside it). The leftovers are
+    // the same repository's own previous-run artifacts, so starting on top
+    // of them is safer than not starting — but say so.
+    fs.mkdirSync(dir, { recursive: true });
+    report(
+      `scratch sandbox: could not remove ${stuckList} from ${dir} and could not move the directory aside (${error?.code ?? error}); ` +
+        `the run starts with these leftovers in place.`
+    );
+    return dir;
+  }
+  report(
+    `scratch sandbox: could not remove ${stuckList} (created by the Codex sandbox user with owner-only permissions); ` +
+      `moved the old scratch directory to ${parked} and started with a fresh one.`
+  );
   return dir;
+}
+
+// Best-effort removal of scratch directories parked by resetScratchSandboxDir.
+// Never throws for an entry that will not go away — that is exactly the case
+// the trash exists for — only reports it, once per call.
+function collectScratchTrash(stateDir, trashDir, repoCwd, report) {
+  if (!fs.existsSync(trashDir)) {
+    return;
+  }
+  assertPathIsPlainDescendant(stateDir, trashDir);
+  assertNotInsideRepo(trashDir, repoCwd, "the scratch trash directory");
+  const stuck = [];
+  for (const entry of fs.readdirSync(trashDir)) {
+    try {
+      fs.rmSync(path.join(trashDir, entry), { recursive: true, force: true });
+    } catch {
+      stuck.push(entry);
+    }
+  }
+  if (stuck.length > 0) {
+    report(
+      `scratch sandbox: ${stuck.length} parked scratch director${stuck.length === 1 ? "y" : "ies"} in ${trashDir} still cannot be deleted by this user; ` +
+        `to clear them, from an elevated prompt run: takeown /f "${trashDir}" /r /a, then icacls "${trashDir}" /grant *S-1-5-32-544:F /t, then rmdir /s /q "${trashDir}"`
+    );
+  }
 }
 
 function resolveScratchSandboxLockFile(cwd) {
